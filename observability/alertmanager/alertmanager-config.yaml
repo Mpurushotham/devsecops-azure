@@ -1,0 +1,265 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: alertmanager
+    app.kubernetes.io/component: alertmanager
+    app.kubernetes.io/part-of: observability-stack
+data:
+  alertmanager.yml: |
+    global:
+      # Default SMTP settings (used by email receivers if configured)
+      smtp_smarthost: "smtp.sendgrid.net:587"
+      smtp_from: "alertmanager@company.com"
+      smtp_auth_username: "apikey"
+      smtp_auth_password_file: /etc/alertmanager/secrets/smtp-password
+
+      # Resolve timeout — how long to wait before marking alert as resolved
+      resolve_timeout: 5m
+
+      # PagerDuty URL
+      pagerduty_url: "https://events.pagerduty.com/v2/enqueue"
+
+      # OpsGenie URL
+      opsgenie_api_url: "https://api.opsgenie.com/"
+
+    # -------------------------------------------------------
+    # Templates
+    # -------------------------------------------------------
+    templates:
+      - /etc/alertmanager/templates/*.tmpl
+
+    # -------------------------------------------------------
+    # Route tree
+    # -------------------------------------------------------
+    route:
+      # Default grouping and timing
+      group_by: ["alertname", "namespace", "severity"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: "slack-info"
+
+      routes:
+        # ---- Critical → PagerDuty immediately ----
+        - match:
+            severity: critical
+          receiver: "pagerduty-critical"
+          group_by: ["alertname", "namespace", "severity", "team"]
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 1h
+          continue: false
+
+        # ---- Security critical → PagerDuty security rotation ----
+        - match:
+            severity: critical
+            team: security
+          receiver: "pagerduty-security"
+          group_by: ["alertname", "namespace", "severity"]
+          group_wait: 0s
+          group_interval: 30s
+          repeat_interval: 30m
+          continue: false
+
+        # ---- Warning → OpsGenie with 15 minute delay ----
+        - match:
+            severity: warning
+          receiver: "opsgenie-warning"
+          group_by: ["alertname", "namespace", "severity", "team"]
+          group_wait: 15m
+          group_interval: 10m
+          repeat_interval: 6h
+          continue: true
+
+        # ---- SLO alerts → dedicated SLO channel ----
+        - match:
+            category: slo
+          receiver: "slack-slo"
+          group_by: ["alertname", "service", "namespace"]
+          group_wait: 1m
+          group_interval: 5m
+          repeat_interval: 2h
+          continue: true
+
+        # ---- Info / low-severity → Slack only ----
+        - match_re:
+            severity: "info|none"
+          receiver: "slack-info"
+          group_wait: 5m
+          group_interval: 15m
+          repeat_interval: 24h
+          continue: false
+
+        # ---- Watchdog (heartbeat) → dedicated receiver ----
+        - match:
+            alertname: "Watchdog"
+          receiver: "watchdog"
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 10m
+          continue: false
+
+    # -------------------------------------------------------
+    # Inhibit rules — suppress lower-severity when higher fires
+    # -------------------------------------------------------
+    inhibit_rules:
+      # Suppress warning when critical is already firing for same alert+namespace
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal:
+          - alertname
+          - namespace
+
+      # Suppress info when warning or critical firing
+      - source_match_re:
+          severity: "critical|warning"
+        target_match:
+          severity: info
+        equal:
+          - alertname
+          - namespace
+
+      # Suppress pod-level alerts when node is not ready
+      - source_match:
+          alertname: NodeNotReady
+        target_match_re:
+          alertname: "PodCrashLooping|DeploymentReplicasUnavailable|PodNotReady"
+        equal:
+          - node
+
+      # Suppress slow error budget burn when fast burn is already firing
+      - source_match:
+          alertname: ErrorBudgetFastBurn
+        target_match:
+          alertname: ErrorBudgetSlowBurn
+        equal:
+          - namespace
+          - service
+
+    # -------------------------------------------------------
+    # Receivers
+    # -------------------------------------------------------
+    receivers:
+
+      # ---- PagerDuty: critical platform/infrastructure alerts ----
+      - name: "pagerduty-critical"
+        pagerduty_configs:
+          - routing_key_file: /etc/alertmanager/secrets/pagerduty-service-key
+            send_resolved: true
+            severity: "{{ if eq .CommonLabels.severity \"critical\" }}critical{{ else }}error{{ end }}"
+            description: >-
+              [{{ .CommonLabels.severity | toUpper }}] {{ .CommonAnnotations.summary }}
+            details:
+              firing: "{{ .Alerts.Firing | len }}"
+              resolved: "{{ .Alerts.Resolved | len }}"
+              namespace: "{{ .CommonLabels.namespace }}"
+              cluster: "{{ .CommonLabels.cluster }}"
+              runbook: "{{ .CommonAnnotations.runbook_url }}"
+              dashboard: "{{ .CommonAnnotations.dashboard_url }}"
+            client: "AlertManager / AKS Prod"
+            client_url: "https://alertmanager.internal"
+            links:
+              - href: "{{ .CommonAnnotations.runbook_url }}"
+                text: "Runbook"
+              - href: "{{ .CommonAnnotations.dashboard_url }}"
+                text: "Dashboard"
+
+      # ---- PagerDuty: security team on-call rotation ----
+      - name: "pagerduty-security"
+        pagerduty_configs:
+          - routing_key_file: /etc/alertmanager/secrets/pagerduty-security-key
+            send_resolved: true
+            severity: critical
+            description: >-
+              [SECURITY] {{ .CommonAnnotations.summary }}
+            details:
+              category: "{{ .CommonLabels.category }}"
+              namespace: "{{ .CommonLabels.namespace }}"
+              node: "{{ .CommonLabels.node }}"
+              cluster: "{{ .CommonLabels.cluster }}"
+              runbook: "{{ .CommonAnnotations.runbook_url }}"
+            client: "AlertManager / AKS Security"
+            client_url: "https://alertmanager.internal"
+
+      # ---- OpsGenie: warning-level alerts (15 min delay applied in route) ----
+      - name: "opsgenie-warning"
+        opsgenie_configs:
+          - api_key_file: /etc/alertmanager/secrets/opsgenie-api-key
+            send_resolved: true
+            message: >-
+              [{{ .CommonLabels.severity | toUpper }}] {{ .CommonAnnotations.summary }}
+            description: "{{ .CommonAnnotations.description }}"
+            tags: >-
+              severity:{{ .CommonLabels.severity }},
+              namespace:{{ .CommonLabels.namespace }},
+              team:{{ .CommonLabels.team }},
+              cluster:{{ .CommonLabels.cluster }}
+            priority: >-
+              {{ if eq .CommonLabels.severity "critical" }}P1
+              {{- else if eq .CommonLabels.severity "warning" }}P2
+              {{- else }}P3{{ end }}
+            details:
+              runbook: "{{ .CommonAnnotations.runbook_url }}"
+              dashboard: "{{ .CommonAnnotations.dashboard_url }}"
+              namespace: "{{ .CommonLabels.namespace }}"
+            responders:
+              - name: "platform-team"
+                type: team
+            source: "AlertManager / {{ .CommonLabels.cluster }}"
+
+      # ---- Slack: SLO-specific channel ----
+      - name: "slack-slo"
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/slack-slo-webhook
+            channel: "#slo-alerts"
+            send_resolved: true
+            title: >-
+              {{ if .Alerts.Firing }}:red_circle:{{ else }}:large_green_circle:{{ end }}
+              [{{ .CommonLabels.severity | toUpper }}] {{ .CommonAnnotations.summary }}
+            text: >-
+              *Description:* {{ .CommonAnnotations.description }}
+
+              *Service:* {{ .CommonLabels.service }}  |  *Namespace:* {{ .CommonLabels.namespace }}
+
+              *Runbook:* {{ .CommonAnnotations.runbook_url }}
+              *Dashboard:* {{ .CommonAnnotations.dashboard_url }}
+            color: >-
+              {{ if .Alerts.Firing }}
+                {{ if eq .CommonLabels.severity "critical" }}danger
+                {{- else }}warning{{ end }}
+              {{- else }}good{{ end }}
+            actions:
+              - type: button
+                text: "Runbook"
+                url: "{{ .CommonAnnotations.runbook_url }}"
+              - type: button
+                text: "Dashboard"
+                url: "{{ .CommonAnnotations.dashboard_url }}"
+
+      # ---- Slack: general info channel ----
+      - name: "slack-info"
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/slack-general-webhook
+            channel: "#infra-alerts"
+            send_resolved: true
+            title: >-
+              {{ if .Alerts.Firing }}:warning:{{ else }}:white_check_mark:{{ end }}
+              [{{ .CommonLabels.severity | toUpper }}] {{ .CommonAnnotations.summary }}
+            text: >-
+              *Namespace:* {{ .CommonLabels.namespace }}
+              *Description:* {{ .CommonAnnotations.description }}
+              *Runbook:* {{ .CommonAnnotations.runbook_url }}
+            color: >-
+              {{ if .Alerts.Firing }}warning{{ else }}good{{ end }}
+
+      # ---- Watchdog heartbeat (no-op receiver) ----
+      - name: "watchdog"
+        webhook_configs:
+          - url: "http://healthchecks.monitoring.svc.cluster.local:8080/ping/alertmanager-watchdog"
+            send_resolved: false
