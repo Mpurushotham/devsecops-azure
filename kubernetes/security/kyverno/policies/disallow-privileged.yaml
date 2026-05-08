@@ -1,0 +1,165 @@
+# =============================================================================
+# Kyverno ClusterPolicy — Disallow Privileged Containers
+#
+# Enforces the Pod Security Standards "Baseline" profile by blocking:
+#   - privileged containers (securityContext.privileged: true)
+#   - hostPID access
+#   - hostIPC access
+#   - hostNetwork access
+#
+# Action: Enforce (requests are rejected at admission time).
+# Scope:  All namespaces except those labeled kyverno.io/exclude: "true"
+#         (e.g., istio-system, cert-manager).
+# =============================================================================
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+  annotations:
+    policies.kyverno.io/title: Disallow Privileged Containers
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/minversion: "1.6.0"
+    policies.kyverno.io/description: >-
+      Privileged containers, hostPID, hostIPC, and hostNetwork share the host
+      kernel namespaces and dramatically expand the attack surface. This policy
+      blocks any Pod that requests these capabilities.
+spec:
+  validationFailureAction: Enforce
+  background: true   # also scan existing resources
+  rules:
+
+    # -------------------------------------------------------------------------
+    # Rule 1 — Block privileged containers
+    # -------------------------------------------------------------------------
+    - name: disallow-privileged-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+              selector:
+                matchLabels:
+                  kyverno.io/exclude: "true"
+      validate:
+        message: >-
+          Privileged containers are not allowed. Remove
+          'securityContext.privileged: true' from all containers and
+          initContainers.
+        pattern:
+          spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false | null"
+            containers:
+              - =(securityContext):
+                  =(privileged): "false | null"
+            =(ephemeralContainers):
+              - =(securityContext):
+                  =(privileged): "false | null"
+
+    # -------------------------------------------------------------------------
+    # Rule 2 — Block hostPID
+    # -------------------------------------------------------------------------
+    - name: disallow-host-pid
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+      validate:
+        message: >-
+          Sharing the host PID namespace (hostPID: true) is not allowed.
+        pattern:
+          spec:
+            =(hostPID): "false | null"
+
+    # -------------------------------------------------------------------------
+    # Rule 3 — Block hostIPC
+    # -------------------------------------------------------------------------
+    - name: disallow-host-ipc
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+      validate:
+        message: >-
+          Sharing the host IPC namespace (hostIPC: true) is not allowed.
+        pattern:
+          spec:
+            =(hostIPC): "false | null"
+
+    # -------------------------------------------------------------------------
+    # Rule 4 — Block hostNetwork
+    # -------------------------------------------------------------------------
+    - name: disallow-host-network
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+      validate:
+        message: >-
+          Using the host network namespace (hostNetwork: true) is not allowed.
+        pattern:
+          spec:
+            =(hostNetwork): "false | null"
+
+    # -------------------------------------------------------------------------
+    # Rule 5 — Block hostPort mappings
+    # -------------------------------------------------------------------------
+    - name: disallow-host-ports
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+      validate:
+        message: >-
+          Mapping host ports (hostPort) is not allowed. Use a Service instead.
+        pattern:
+          spec:
+            =(initContainers):
+              - =(ports):
+                  - =(hostPort): "0 | null"
+            containers:
+              - =(ports):
+                  - =(hostPort): "0 | null"
