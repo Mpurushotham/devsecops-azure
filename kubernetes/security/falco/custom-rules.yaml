@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-custom-rules
+  namespace: security
+  labels:
+    app: falco
+data:
+  custom_rules.yaml: |
+    # ── Custom Falco rules for Azure DevSecOps ─────────────────────────────
+
+    # Detect shell spawned inside a container
+    - rule: Shell Spawned in Container
+      desc: A shell was spawned inside a running container
+      condition: >
+        spawned_process and
+        container and
+        (proc.name in (shell_binaries) or proc.name in (bash, sh, zsh, fish, dash)) and
+        not proc.pname in (shell_binaries) and
+        not container.image.repository in (allowed_shell_spawning_images)
+      output: >
+        Shell spawned in container
+        (user=%user.name user_loginuid=%user.loginuid
+        container_id=%container.id container_name=%container.name
+        image=%container.image.repository:%container.image.tag
+        proc=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, shell, T1059]
+
+    # Detect writes to sensitive files
+    - rule: Write to Sensitive Files
+      desc: Attempt to write to sensitive system files inside a container
+      condition: >
+        open_write and
+        container and
+        (fd.name startswith /etc/passwd or
+         fd.name startswith /etc/shadow or
+         fd.name startswith /etc/sudoers or
+         fd.name startswith /root/.ssh or
+         fd.name startswith /etc/crontab or
+         fd.name startswith /var/spool/cron)
+      output: >
+        Sensitive file write attempt
+        (user=%user.name user_loginuid=%user.loginuid
+        file=%fd.name container_id=%container.id
+        image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, filesystem, T1098]
+
+    # Detect unexpected outbound network connections
+    - rule: Unexpected Outbound Network Connection
+      desc: Container made outbound connection to unexpected destination
+      condition: >
+        outbound and
+        container and
+        not fd.sport in (80, 443, 8080, 8443, 3000, 5000) and
+        not fd.dip in (allowed_outbound_destinations) and
+        not proc.name in (allowed_network_tools) and
+        fd.sockfamily = ip
+      output: >
+        Unexpected outbound connection
+        (user=%user.name proc=%proc.name
+        container_id=%container.id image=%container.image.repository
+        connection=%fd.name k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [network, T1071]
+
+    # Detect privilege escalation (setuid binary execution)
+    - rule: Setuid Binary Execution in Container
+      desc: A setuid binary was executed inside a container (privilege escalation)
+      condition: >
+        spawned_process and
+        container and
+        proc.is_suid_exe = true and
+        not proc.name in (allowed_setuid_binaries)
+      output: >
+        Setuid binary executed in container
+        (user=%user.name proc=%proc.name exe=%proc.exe
+        container_id=%container.id image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, privilege_escalation, T1548]
+
+    # Detect container drift — new binary not in original image
+    - rule: Container Drift Detected
+      desc: A new binary was executed that was not present in the original container image
+      condition: >
+        spawned_process and
+        container and
+        (proc.is_exe_upper_layer = true or
+         (evt.type = execve and not proc.exe in (container_entrypoint_binaries)))
+      output: >
+        Container drift detected — new binary executed
+        (user=%user.name proc=%proc.name exe=%proc.exe
+        container_id=%container.id image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, drift, T1611]
+
+    # Detect crypto mining activity
+    - rule: Crypto Mining Activity
+      desc: Possible crypto mining detected based on process name or network connection
+      condition: >
+        (spawned_process and
+         (proc.name in (known_crypto_miners) or
+          proc.cmdline contains "stratum+tcp" or
+          proc.cmdline contains "xmrig" or
+          proc.cmdline contains "--donate-level" or
+          proc.cmdline contains "mining")) or
+        (outbound and
+         fd.sport in (3333, 4444, 5555, 7777, 8333, 9332, 14444, 45560))
+      output: >
+        Crypto mining detected
+        (user=%user.name proc=%proc.name cmdline=%proc.cmdline
+        container_id=%container.id image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, cryptomining, T1496]
+
+    # Detect kubectl/k8s API access from inside a pod
+    - rule: Kubernetes API Access from Container
+      desc: kubectl or k8s API call attempted from inside a running container
+      condition: >
+        spawned_process and
+        container and
+        (proc.name = kubectl or
+         (proc.name in (curl, wget) and
+          (proc.cmdline contains "kube-apiserver" or
+           proc.cmdline contains ":6443" or
+           proc.cmdline contains "kubernetes.default")))
+      output: >
+        Kubernetes API access from container
+        (user=%user.name proc=%proc.name cmdline=%proc.cmdline
+        container_id=%container.id image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, k8s_api, T1613]
+
+    # Lists used in rules above
+    - list: allowed_shell_spawning_images
+      items: []
+
+    - list: known_crypto_miners
+      items: [xmrig, minerd, cpuminer, cgminer, bfgminer, ethminer, monero-miner]
+
+    - list: allowed_setuid_binaries
+      items: [ping, ping6, newgrp, su]
+
+    - list: allowed_network_tools
+      items: [curl, wget, dig, nslookup, nc]
+
+    - list: allowed_outbound_destinations
+      items: []
+
+    - list: container_entrypoint_binaries
+      items: [python, python3, node, java, nginx, sh, bash]
