@@ -1,0 +1,212 @@
+# =============================================================================
+# Kyverno ClusterPolicy — Require Non-Root Containers
+#
+# Enforces the following security context requirements on every container:
+#   1. runAsNonRoot: true          — process must not run as UID 0
+#   2. capabilities.drop: [ALL]   — drop all Linux capabilities
+#   3. readOnlyRootFilesystem: true — immutable root FS prevents tampering
+#   4. allowPrivilegeEscalation: false — prevent setuid/sudo escalation
+#   5. seccompProfile: RuntimeDefault or Localhost — syscall filtering
+#
+# Action: Enforce (cluster-wide, excluding privileged system namespaces).
+# =============================================================================
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-non-root-containers
+  annotations:
+    policies.kyverno.io/title: Require Non-Root Containers
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/minversion: "1.6.0"
+    policies.kyverno.io/description: >-
+      Containers must run as a non-root user, drop all Linux capabilities,
+      use a read-only root filesystem, and prevent privilege escalation.
+      These controls significantly reduce the impact of a container escape.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+
+    # -------------------------------------------------------------------------
+    # Rule 1 — runAsNonRoot must be true (containers)
+    # -------------------------------------------------------------------------
+    - name: require-run-as-non-root
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Container '{{ element.name }}' must set
+          securityContext.runAsNonRoot: true. Running as root (UID 0) is
+          not permitted.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.runAsNonRoot }}"
+                    operator: NotEquals
+                    value: true
+          - list: "request.object.spec.initContainers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.runAsNonRoot }}"
+                    operator: NotEquals
+                    value: true
+
+    # -------------------------------------------------------------------------
+    # Rule 2 — All capabilities must be dropped
+    # -------------------------------------------------------------------------
+    - name: require-drop-all-capabilities
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Container '{{ element.name }}' must drop ALL Linux capabilities
+          (securityContext.capabilities.drop: [ALL]). Add specific capabilities
+          only if absolutely required and document the business justification.
+        pattern:
+          spec:
+            =(initContainers):
+              - securityContext:
+                  capabilities:
+                    drop:
+                      - ALL
+            containers:
+              - securityContext:
+                  capabilities:
+                    drop:
+                      - ALL
+            =(ephemeralContainers):
+              - securityContext:
+                  capabilities:
+                    drop:
+                      - ALL
+
+    # -------------------------------------------------------------------------
+    # Rule 3 — Read-only root filesystem required
+    # -------------------------------------------------------------------------
+    - name: require-readonly-root-filesystem
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Container '{{ element.name }}' must set
+          securityContext.readOnlyRootFilesystem: true. Mount writable
+          volumes for any paths that need write access.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.readOnlyRootFilesystem }}"
+                    operator: NotEquals
+                    value: true
+          - list: "request.object.spec.initContainers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.readOnlyRootFilesystem }}"
+                    operator: NotEquals
+                    value: true
+
+    # -------------------------------------------------------------------------
+    # Rule 4 — Privilege escalation must be disabled
+    # -------------------------------------------------------------------------
+    - name: disallow-privilege-escalation
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Container '{{ element.name }}' must set
+          securityContext.allowPrivilegeEscalation: false to prevent
+          privilege escalation via setuid binaries or sudo.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.allowPrivilegeEscalation }}"
+                    operator: NotEquals
+                    value: false
+          - list: "request.object.spec.initContainers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.allowPrivilegeEscalation }}"
+                    operator: NotEquals
+                    value: false
+
+    # -------------------------------------------------------------------------
+    # Rule 5 — Require a seccomp profile (Restricted PSS compliance)
+    # -------------------------------------------------------------------------
+    - name: require-seccomp-profile
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - production
+                - staging
+      validate:
+        message: >-
+          Pod must define a seccomp profile. Set
+          spec.securityContext.seccompProfile.type to 'RuntimeDefault'
+          or 'Localhost'.
+        pattern:
+          spec:
+            securityContext:
+              seccompProfile:
+                type: "RuntimeDefault | Localhost"
