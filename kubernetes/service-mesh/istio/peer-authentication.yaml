@@ -1,0 +1,162 @@
+# =============================================================================
+# Istio PeerAuthentication — mTLS Configuration
+#
+# Configures mutual TLS (mTLS) for service-to-service communication within
+# the Istio mesh.
+#
+# Policies:
+#   1. Mesh-wide STRICT default (istio-system namespace)
+#      All sidecar-injected services must use mTLS. Non-injected traffic
+#      is rejected at the proxy level.
+#
+#   2. Production namespace — STRICT mTLS
+#      All intra-namespace and cross-namespace communication must use mTLS.
+#      Plaintext connections are rejected. SPIFFE/SVID identities required.
+#
+#   3. Staging namespace — PERMISSIVE mTLS
+#      Accepts both mTLS and plaintext. Allows non-injected clients (e.g.,
+#      external load tests, legacy tooling) to connect during validation.
+#      Upgrade to STRICT before production promotion.
+#
+#   4. DestinationRules — enforce ISTIO_MUTUAL TLS on outbound connections
+#      from each namespace to prevent accidental plaintext egress.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Mesh-wide PeerAuthentication (applied in istio-system namespace)
+#    Acts as the default for the entire mesh.
+#    Namespace-level policies override this default for specific namespaces.
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+  labels:
+    team: platform
+    environment: shared
+    security-tier: privileged
+  annotations:
+    description: >-
+      Mesh-wide default PeerAuthentication. Sets STRICT mTLS as the baseline
+      for all sidecars in the mesh. Namespace-level policies can override
+      this default (e.g., PERMISSIVE for staging).
+spec:
+  mtls:
+    mode: STRICT
+
+# -----------------------------------------------------------------------------
+# 2. Production namespace — STRICT mTLS
+#    All inbound connections to pods in production must present a valid
+#    SPIFFE SVID (mTLS client certificate issued by Istio CA).
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    security-tier: restricted
+  annotations:
+    description: >-
+      Enforces STRICT mTLS for all pods in the production namespace.
+      Plaintext connections are rejected. SPIFFE/X.509 SVIDs required.
+      Works in conjunction with AuthorizationPolicy for fine-grained access.
+spec:
+  mtls:
+    mode: STRICT
+
+# -----------------------------------------------------------------------------
+# 3. Staging namespace — PERMISSIVE mTLS
+#    Accepts both mTLS and plaintext. Allows external load test clients
+#    and legacy tools that do not have Istio sidecar injection.
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    security-tier: standard
+  annotations:
+    description: >-
+      Permissive mTLS for staging — accepts both mTLS and plaintext traffic.
+      Use this during initial onboarding and integration testing. Switch to
+      STRICT before promoting applications to production.
+spec:
+  mtls:
+    mode: PERMISSIVE
+
+# -----------------------------------------------------------------------------
+# 4. DestinationRule — Enforce ISTIO_MUTUAL TLS for outbound from production
+#    Ensures that even if a destination service is permissive, production
+#    pods always initiate connections using mTLS.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: mtls-production
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    security-tier: restricted
+  annotations:
+    description: >-
+      Enforces ISTIO_MUTUAL TLS for all outbound connections originating
+      from the production namespace. Prevents any plaintext egress even
+      when connecting to PERMISSIVE services in other namespaces.
+spec:
+  host: "*.production.svc.cluster.local"
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+
+# DestinationRule for cross-namespace calls from production
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: mtls-monitoring-from-production
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+  annotations:
+    description: >-
+      Ensures mTLS is used when production pods call monitoring services.
+spec:
+  host: "*.monitoring.svc.cluster.local"
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+
+# DestinationRule — staging namespace outbound
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: mtls-staging
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    security-tier: standard
+  annotations:
+    description: >-
+      Uses ISTIO_MUTUAL for outbound traffic within staging. Combined with
+      PERMISSIVE PeerAuthentication, this means staging pods initiate mTLS
+      while still accepting plaintext inbound connections.
+spec:
+  host: "*.staging.svc.cluster.local"
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
