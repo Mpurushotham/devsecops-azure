@@ -1,0 +1,166 @@
+# =============================================================================
+# Kyverno ClusterPolicy — Require CPU and Memory Requests and Limits
+#
+# Every container (including init containers) MUST declare:
+#   - resources.requests.cpu
+#   - resources.requests.memory
+#   - resources.limits.cpu
+#   - resources.limits.memory
+#
+# Without these fields the Kubernetes scheduler cannot make informed placement
+# decisions and a noisy-neighbour workload can exhaust node resources,
+# causing cascading failures.
+#
+# Action: Enforce (cluster-wide, excluding system namespaces).
+# =============================================================================
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+  annotations:
+    policies.kyverno.io/title: Require CPU and Memory Requests and Limits
+    policies.kyverno.io/category: Resource Management
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/minversion: "1.6.0"
+    policies.kyverno.io/description: >-
+      All containers must specify CPU and memory requests and limits to
+      ensure fair scheduling and prevent resource exhaustion on cluster nodes.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+
+    # -------------------------------------------------------------------------
+    # Rule 1 — Regular containers must have requests and limits
+    # -------------------------------------------------------------------------
+    - name: require-limits-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Container '{{ element.name }}' must specify resources.requests.cpu,
+          resources.requests.memory, resources.limits.cpu and
+          resources.limits.memory.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.resources.requests.cpu | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.requests.memory | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.limits.cpu | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.limits.memory | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+
+    # -------------------------------------------------------------------------
+    # Rule 2 — Init containers must have requests and limits
+    # -------------------------------------------------------------------------
+    - name: require-limits-init-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Init container '{{ element.name }}' must specify
+          resources.requests.cpu, resources.requests.memory,
+          resources.limits.cpu and resources.limits.memory.
+        foreach:
+          - list: "request.object.spec.initContainers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.resources.requests.cpu | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.requests.memory | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.limits.cpu | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.limits.memory | to_string(@) }}"
+                    operator: Equals
+                    value: ""
+
+    # -------------------------------------------------------------------------
+    # Rule 3 — Enforce reasonable upper bounds (mutation guard)
+    #          Deny unreasonably large limits to prevent resource hoarding.
+    #          Adjust thresholds to match your node sizes.
+    # -------------------------------------------------------------------------
+    - name: limit-cpu-upper-bound
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - production
+                - staging
+      validate:
+        message: >-
+          Container '{{ element.name }}' CPU limit exceeds the maximum
+          allowed value of 8 cores. Please contact the platform team if
+          you have a legitimate need for more CPU.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ divide(element.resources.limits.cpu, '1') }}"
+                    operator: GreaterThan
+                    value: "8"
+
+    - name: limit-memory-upper-bound
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - production
+                - staging
+      validate:
+        message: >-
+          Container '{{ element.name }}' memory limit exceeds the maximum
+          allowed value of 16Gi. Please contact the platform team if you
+          have a legitimate need for more memory.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ divide(element.resources.limits.memory, '1Mi') }}"
+                    operator: GreaterThan
+                    value: "16384"
