@@ -1,0 +1,382 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: observability-stack
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      scrape_timeout: 10s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: "aks-prod"
+        region: "eastus"
+        environment: "production"
+
+    # Alertmanager configuration
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager.monitoring.svc.cluster.local:9093
+          timeout: 10s
+          api_version: v2
+
+    # Load alert rules
+    rule_files:
+      - /etc/prometheus/rules/*.yaml
+
+    # Remote write to VictoriaMetrics for long-term storage
+    remote_write:
+      - url: "http://victoriametrics.monitoring.svc.cluster.local:8428/api/v1/write"
+        name: victoriametrics
+        queue_config:
+          capacity: 10000
+          max_shards: 30
+          min_shards: 1
+          max_samples_per_send: 5000
+          batch_send_deadline: 5s
+          min_backoff: 30ms
+          max_backoff: 100ms
+        write_relabel_configs:
+          - source_labels: [__name__]
+            regex: "go_.*|process_.*"
+            action: drop
+        tls_config:
+          insecure_skip_verify: false
+
+      # Remote write to Thanos sidecar for HA deduplication
+      - url: "http://thanos-sidecar.monitoring.svc.cluster.local:10908/api/v1/receive"
+        name: thanos
+        queue_config:
+          capacity: 5000
+          max_shards: 10
+          min_shards: 1
+          max_samples_per_send: 2000
+          batch_send_deadline: 5s
+        write_relabel_configs:
+          - source_labels: [__name__]
+            regex: "up|scrape_.*"
+            action: keep
+
+    scrape_configs:
+
+      # -------------------------------------------------------
+      # Kubernetes API Servers
+      # -------------------------------------------------------
+      - job_name: "kubernetes-apiservers"
+        kubernetes_sd_configs:
+          - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: false
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - source_labels:
+              [
+                __meta_kubernetes_namespace,
+                __meta_kubernetes_service_name,
+                __meta_kubernetes_endpoint_port_name,
+              ]
+            action: keep
+            regex: default;kubernetes;https
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+
+      # -------------------------------------------------------
+      # Kubernetes Nodes (kubelet)
+      # -------------------------------------------------------
+      - job_name: "kubernetes-nodes"
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: false
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: "kubelet_running_containers|kubelet_node_name|kubelet_volume_stats.*"
+            action: keep
+
+      # -------------------------------------------------------
+      # Kubernetes Pods (auto-discovery)
+      # -------------------------------------------------------
+      - job_name: "kubernetes-pods"
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+            action: replace
+            regex: (https?)
+            target_label: __scheme__
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Pending|Succeeded|Failed|Completed
+            action: drop
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: "container_tasks_state|container_memory_failures_total"
+            action: drop
+
+      # -------------------------------------------------------
+      # Kubernetes Services (auto-discovery)
+      # -------------------------------------------------------
+      - job_name: "kubernetes-services"
+        kubernetes_sd_configs:
+          - role: service
+        metrics_path: /probe
+        params:
+          module: [http_2xx]
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_probe]
+            action: keep
+            regex: "true"
+          - source_labels: [__address__]
+            target_label: __param_target
+          - target_label: __address__
+            replacement: blackbox-exporter.monitoring.svc.cluster.local:9115
+          - source_labels: [__param_target]
+            target_label: instance
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            target_label: kubernetes_name
+
+      # -------------------------------------------------------
+      # cAdvisor (container resource metrics)
+      # -------------------------------------------------------
+      - job_name: "cadvisor"
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: false
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+        metric_relabel_configs:
+          - source_labels: [container]
+            regex: "^$"
+            action: drop
+          - source_labels: [__name__]
+            regex: "container_cpu_cfs_throttled_seconds_total|container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_network_receive_bytes_total|container_network_transmit_bytes_total|container_fs_reads_bytes_total|container_fs_writes_bytes_total"
+            action: keep
+
+      # -------------------------------------------------------
+      # kube-state-metrics
+      # -------------------------------------------------------
+      - job_name: "kube-state-metrics"
+        static_configs:
+          - targets:
+              - kube-state-metrics.kube-system.svc.cluster.local:8080
+        relabel_configs:
+          - target_label: job
+            replacement: kube-state-metrics
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: "kube_pod_.*|kube_deployment_.*|kube_statefulset_.*|kube_daemonset_.*|kube_node_.*|kube_namespace_.*|kube_horizontalpodautoscaler_.*|kube_persistentvolume.*|kube_job_.*|kube_cronjob_.*"
+            action: keep
+
+      # -------------------------------------------------------
+      # Node Exporter (host-level metrics)
+      # -------------------------------------------------------
+      - job_name: "node-exporter"
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - monitoring
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_endpoints_name]
+            regex: "node-exporter"
+            action: keep
+          - source_labels: [__meta_kubernetes_endpoint_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: "node_cpu_seconds_total|node_memory_.*|node_filesystem_.*|node_network_.*|node_disk_.*|node_load.*|node_pressure.*"
+            action: keep
+
+      # -------------------------------------------------------
+      # Istio service mesh metrics
+      # -------------------------------------------------------
+      - job_name: "istio-mesh"
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - istio-system
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: istio-telemetry;prometheus
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: "istio_requests_total|istio_request_duration_milliseconds_.*|istio_tcp_.*"
+            action: keep
+
+      - job_name: "istio-pilot"
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - istio-system
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: "istiod|pilot"
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: "http-monitoring|http"
+
+      - job_name: "istio-envoy"
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: ".*envoy-prom"
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "15090"
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod_name
+
+      # -------------------------------------------------------
+      # Falco security runtime metrics
+      # -------------------------------------------------------
+      - job_name: "falco"
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - falco
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: "falco"
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: "metrics"
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: "falco_events_total|falco_.*"
+            action: keep
+
+      # -------------------------------------------------------
+      # Application metrics (custom apps in app namespaces)
+      # -------------------------------------------------------
+      - job_name: "application-metrics"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - default
+                - production
+                - staging
+                - development
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+            replacement: $1
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_label_version]
+            target_label: version
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Pending|Succeeded|Failed|Completed
+            action: drop
+
+      # -------------------------------------------------------
+      # Prometheus self-monitoring
+      # -------------------------------------------------------
+      - job_name: "prometheus"
+        static_configs:
+          - targets:
+              - localhost:9090
+        relabel_configs:
+          - target_label: component
+            replacement: prometheus
+
+      # -------------------------------------------------------
+      # AlertManager self-monitoring
+      # -------------------------------------------------------
+      - job_name: "alertmanager"
+        static_configs:
+          - targets:
+              - alertmanager.monitoring.svc.cluster.local:9093
