@@ -1,0 +1,538 @@
+# =============================================================================
+# RBAC Manifests — AKS Cluster with Entra ID (Azure AD) Integration
+#
+# Prerequisites:
+#   - AKS cluster created with --enable-aad --enable-azure-rbac
+#   - Azure RBAC integration enabled (AKS-managed Azure AD)
+#
+# Entra ID group Object IDs must be substituted before applying:
+#   <ENTRA_DEVELOPERS_GROUP_OID>     — Entra ID group for application developers
+#   <ENTRA_OPERATORS_GROUP_OID>      — Entra ID group for platform operators
+#   <ENTRA_SECURITY_AUDITORS_OID>    — Entra ID group for security auditors
+#
+# Roles defined:
+#   1. developer        — Read-only access to workload resources in staging
+#   2. operator         — Full CRUD access across all non-system namespaces
+#   3. security-auditor — Cluster-wide read-only for audit and compliance
+#   4. ci-deployer      — Minimal permissions for CI/CD pipeline service accounts
+#
+# Azure built-in AKS RBAC roles used for kubeconfig credential access:
+#   - Azure Kubernetes Service Cluster User Role
+#   - Azure Kubernetes Service RBAC Reader
+#   - Azure Kubernetes Service RBAC Writer
+#   - Azure Kubernetes Service RBAC Admin
+#   - Azure Kubernetes Service RBAC Cluster Admin
+#
+# Apply with: kubectl apply -f rbac.yaml
+# =============================================================================
+
+# =============================================================================
+# 1. DEVELOPER ROLE
+#    Read-only access to core workload resources, scoped to the staging
+#    namespace via RoleBinding. Includes pod port-forward for local debugging.
+# =============================================================================
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: developer
+  labels:
+    rbac.example.com/role-type: application
+    rbac.example.com/managed-by: platform-team
+    team: platform
+  annotations:
+    description: >-
+      Developer read-only role. Bound to the staging namespace only.
+      Provides visibility into workload state without modification rights.
+rules:
+  # Core workload visibility
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/status
+      - services
+      - endpoints
+      - configmaps
+      - events
+      - replicationcontrollers
+      - persistentvolumeclaims
+      - resourcequotas
+      - limitranges
+    verbs: ["get", "list", "watch"]
+  # Apps workloads
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+      - controllerrevisions
+    verbs: ["get", "list", "watch"]
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+      - ingressclasses
+    verbs: ["get", "list", "watch"]
+  # Autoscaling
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["get", "list", "watch"]
+  # Batch
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+  # Port-forward for local debugging (staging only — enforced by RoleBinding scope)
+  - apiGroups: [""]
+    resources:
+      - pods/portforward
+    verbs: ["create"]
+  # Policy resources (PodDisruptionBudgets)
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["get", "list", "watch"]
+  # Istio / service-mesh visibility
+  - apiGroups: ["networking.istio.io", "security.istio.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Argo CD application visibility
+  - apiGroups: ["argoproj.io"]
+    resources:
+      - applications
+      - applicationsets
+      - appprojects
+    verbs: ["get", "list", "watch"]
+
+---
+# Bind developer ClusterRole to the Entra ID developers group — staging namespace only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: developer-binding
+  namespace: staging
+  labels:
+    rbac.example.com/role-type: application
+    rbac.example.com/managed-by: platform-team
+    team: platform
+  annotations:
+    description: >-
+      Grants the Entra ID developers group developer read-only access in
+      the staging namespace. Does NOT grant production access.
+subjects:
+  - kind: Group
+    name: "<ENTRA_DEVELOPERS_GROUP_OID>"   # Replace with Entra ID group Object ID
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+
+# =============================================================================
+# 2. OPERATOR ROLE
+#    Full CRUD access to workload namespaces (production, staging, monitoring,
+#    argocd). Explicitly excludes system namespaces (kube-system, etc.) via
+#    namespace-scoped RoleBindings rather than a ClusterRoleBinding.
+# =============================================================================
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator
+  labels:
+    rbac.example.com/role-type: operations
+    rbac.example.com/managed-by: platform-team
+    team: platform
+  annotations:
+    description: >-
+      Operator full-access role. Bound via RoleBindings to specific
+      non-system namespaces. Not bound cluster-wide to prevent system
+      namespace access.
+rules:
+  # Full control over core resources
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/exec
+      - pods/portforward
+      - pods/status
+      - pods/attach
+      - services
+      - endpoints
+      - configmaps
+      - persistentvolumeclaims
+      - events
+      - secrets
+      - serviceaccounts
+      - replicationcontrollers
+      - resourcequotas
+      - limitranges
+      - namespaces
+    verbs: ["*"]
+  # Apps
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+      - controllerrevisions
+    verbs: ["*"]
+  # Batch
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["*"]
+  # Autoscaling
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["*"]
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+      - ingressclasses
+    verbs: ["*"]
+  # Policy (PodDisruptionBudgets)
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["*"]
+  # RBAC inspection — read only to prevent privilege escalation
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - roles
+      - rolebindings
+    verbs: ["get", "list", "watch"]
+  # Istio traffic management and security
+  - apiGroups: ["networking.istio.io", "security.istio.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  # cert-manager certificates and issuers (namespace-scoped)
+  - apiGroups: ["cert-manager.io"]
+    resources:
+      - certificates
+      - certificaterequests
+      - issuers
+    verbs: ["*"]
+  # Argo CD applications
+  - apiGroups: ["argoproj.io"]
+    resources:
+      - applications
+      - applicationsets
+      - appprojects
+    verbs: ["*"]
+  # Kyverno policy reports (read-only — policies are platform-managed)
+  - apiGroups: ["kyverno.io", "wgpolicyk8s.io"]
+    resources:
+      - policyreports
+      - clusterpolicyreports
+      - admissionreports
+    verbs: ["get", "list", "watch"]
+  # Metrics and custom resources
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - pods
+      - nodes
+    verbs: ["get", "list", "watch"]
+
+---
+# Bind operator role in production
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: operator-binding
+  namespace: production
+  labels:
+    rbac.example.com/role-type: operations
+    rbac.example.com/managed-by: platform-team
+    team: platform
+subjects:
+  - kind: Group
+    name: "<ENTRA_OPERATORS_GROUP_OID>"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: operator
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Bind operator role in staging
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: operator-binding
+  namespace: staging
+  labels:
+    rbac.example.com/role-type: operations
+    rbac.example.com/managed-by: platform-team
+    team: platform
+subjects:
+  - kind: Group
+    name: "<ENTRA_OPERATORS_GROUP_OID>"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: operator
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Bind operator role in monitoring
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: operator-binding
+  namespace: monitoring
+  labels:
+    rbac.example.com/role-type: operations
+    rbac.example.com/managed-by: platform-team
+    team: platform
+subjects:
+  - kind: Group
+    name: "<ENTRA_OPERATORS_GROUP_OID>"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: operator
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Bind operator role in argocd
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: operator-binding
+  namespace: argocd
+  labels:
+    rbac.example.com/role-type: operations
+    rbac.example.com/managed-by: platform-team
+    team: platform
+subjects:
+  - kind: Group
+    name: "<ENTRA_OPERATORS_GROUP_OID>"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: operator
+  apiGroup: rbac.authorization.k8s.io
+
+# =============================================================================
+# 3. SECURITY AUDITOR ROLE
+#    Read-only cluster-wide access for security personnel, compliance auditors,
+#    and automated scanning tools (Trivy Operator, Kubescape, etc.).
+#    Bound via ClusterRoleBinding for full cluster visibility.
+# =============================================================================
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: security-auditor
+  labels:
+    rbac.example.com/role-type: audit
+    rbac.example.com/managed-by: security-team
+    team: security
+  annotations:
+    description: >-
+      Cluster-wide read-only role for security auditors. Grants visibility
+      into all resources including RBAC, NetworkPolicies, and secrets metadata
+      (not secret values). Used by automated compliance scanners.
+rules:
+  # All API groups — read only
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Non-resource URLs for health checks and metrics
+  - nonResourceURLs:
+      - "/healthz"
+      - "/livez"
+      - "/readyz"
+      - "/metrics"
+      - "/api/*"
+      - "/apis/*"
+      - "/version"
+    verbs: ["get"]
+
+---
+# Bind security-auditor cluster-wide to the Entra ID security auditors group
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: security-auditor-binding
+  labels:
+    rbac.example.com/role-type: audit
+    rbac.example.com/managed-by: security-team
+    team: security
+  annotations:
+    description: >-
+      Grants the Entra ID security auditors group cluster-wide read access.
+      Required for compliance scanning tools and manual security reviews.
+subjects:
+  - kind: Group
+    name: "<ENTRA_SECURITY_AUDITORS_OID>"   # Replace with Entra ID group Object ID
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: security-auditor
+  apiGroup: rbac.authorization.k8s.io
+
+# =============================================================================
+# 4. CI DEPLOYER SERVICE ACCOUNT
+#    Minimal permissions needed by a CI/CD pipeline to update Deployments,
+#    roll out new image tags, and verify rollout status.
+#    One ServiceAccount per target namespace; scoped via RoleBindings.
+# =============================================================================
+
+# ServiceAccount in staging namespace
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-deployer
+  namespace: staging
+  labels:
+    team: platform
+    app.kubernetes.io/component: ci
+    rbac.example.com/managed-by: platform-team
+  annotations:
+    description: >-
+      Service account used by CI/CD pipelines for staging deployments.
+      If using Azure Workload Identity, annotate with:
+      azure.workload.identity/client-id: <MANAGED_IDENTITY_CLIENT_ID>
+
+# ServiceAccount in production namespace
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-deployer
+  namespace: production
+  labels:
+    team: platform
+    app.kubernetes.io/component: ci
+    rbac.example.com/managed-by: platform-team
+  annotations:
+    description: >-
+      Service account used by CI/CD pipelines for production deployments.
+      Requires additional approval gate before production rollout.
+      If using Azure Workload Identity, annotate with:
+      azure.workload.identity/client-id: <MANAGED_IDENTITY_CLIENT_ID>
+
+# Minimal ClusterRole for CI deployment operations
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ci-deployer
+  labels:
+    rbac.example.com/role-type: cicd
+    rbac.example.com/managed-by: platform-team
+    team: platform
+  annotations:
+    description: >-
+      Minimal permission set for CI/CD pipelines. Allows image updates via
+      patch on Deployments and StatefulSets, rollout status polling, and
+      ArgoCD sync triggering. Does NOT allow secret reads or RBAC changes.
+rules:
+  # Read Deployments / StatefulSets / ReplicaSets (to inspect current state)
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+    verbs: ["get", "list", "watch"]
+  # Update image tag via 'kubectl set image' or 'kubectl rollout restart'
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+    verbs: ["patch", "update"]
+  # Rollout status and restart
+  - apiGroups: ["apps"]
+    resources:
+      - deployments/status
+      - statefulsets/status
+      - replicasets/status
+    verbs: ["get", "watch"]
+  # Read Pods and their logs to verify readiness after deployment
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/status
+    verbs: ["get", "list", "watch"]
+  # Read ConfigMaps needed by deployment tooling (not Secret access)
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: ["get", "list", "watch"]
+  # Read Services to verify endpoints are healthy post-deploy
+  - apiGroups: [""]
+    resources:
+      - services
+      - endpoints
+    verbs: ["get", "list", "watch"]
+  # Read Events for deployment failure diagnostics
+  - apiGroups: [""]
+    resources:
+      - events
+    verbs: ["get", "list", "watch"]
+  # Argo CD sync trigger (optional — remove if not using ArgoCD sync via CI)
+  - apiGroups: ["argoproj.io"]
+    resources:
+      - applications
+    verbs: ["get", "list", "watch", "patch"]
+  # Kyverno policy reports (read-only) — CI can fail on policy violations
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources:
+      - policyreports
+      - clusterpolicyreports
+    verbs: ["get", "list", "watch"]
+
+# Bind CI deployer role in staging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer-binding
+  namespace: staging
+  labels:
+    rbac.example.com/role-type: cicd
+    rbac.example.com/managed-by: platform-team
+    team: platform
+subjects:
+  - kind: ServiceAccount
+    name: ci-deployer
+    namespace: staging
+roleRef:
+  kind: ClusterRole
+  name: ci-deployer
+  apiGroup: rbac.authorization.k8s.io
+
+# Bind CI deployer role in production
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer-binding
+  namespace: production
+  labels:
+    rbac.example.com/role-type: cicd
+    rbac.example.com/managed-by: platform-team
+    team: platform
+subjects:
+  - kind: ServiceAccount
+    name: ci-deployer
+    namespace: production
+roleRef:
+  kind: ClusterRole
+  name: ci-deployer
+  apiGroup: rbac.authorization.k8s.io
