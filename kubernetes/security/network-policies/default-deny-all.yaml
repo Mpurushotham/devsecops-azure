@@ -1,0 +1,72 @@
+# =============================================================================
+# NetworkPolicy — Default Deny All (Ingress + Egress)
+#
+# Applied to both the 'production' and 'staging' namespaces.
+#
+# This implements the zero-trust network baseline: every connection must be
+# explicitly permitted by a subsequent NetworkPolicy allow rule. Without an
+# explicit allow, all traffic is dropped — including:
+#   - Pod-to-pod traffic within the same namespace
+#   - Cross-namespace traffic
+#   - Egress to the internet
+#   - Ingress from ingress controllers or load balancers
+#
+# IMPORTANT: Apply these policies BEFORE creating allow policies to eliminate
+# any window during which traffic is unrestricted.
+#
+# Follow-up policies to apply after this baseline:
+#   - allow-ingress.yaml    — permits Istio ingress gateway → app pods
+#   - (additional allow policies per service)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Production namespace — deny all ingress and egress
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    security-tier: restricted
+    policy-type: default-deny
+  annotations:
+    description: >-
+      Zero-trust baseline: drops all ingress and egress for every pod in the
+      production namespace. All permitted communication paths must be explicitly
+      declared via additional NetworkPolicy resources.
+spec:
+  # Empty podSelector matches ALL pods in the namespace
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress or egress rules = deny everything
+
+# -----------------------------------------------------------------------------
+# Staging namespace — deny all ingress and egress
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    security-tier: standard
+    policy-type: default-deny
+  annotations:
+    description: >-
+      Zero-trust baseline: drops all ingress and egress for every pod in the
+      staging namespace. Mirrors the production posture for pre-production
+      validation of network policies.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
