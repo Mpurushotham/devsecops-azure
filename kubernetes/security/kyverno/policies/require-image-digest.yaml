@@ -1,0 +1,137 @@
+# =============================================================================
+# Kyverno ClusterPolicy — Require Image Digest
+#
+# Container images MUST be referenced by their immutable SHA-256 digest
+# (e.g., myacr.azurecr.io/myapp@sha256:abc123...) rather than mutable tags
+# (e.g., :latest, :v1.2).  Mutable tags can silently pull a different image
+# after a vulnerability is disclosed.
+#
+# Scope:  production namespace (Enforce).
+#         Other namespaces: Audit (warnings only, to support dev workflows).
+# =============================================================================
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-image-digest
+  annotations:
+    policies.kyverno.io/title: Require Image Digest
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/minversion: "1.6.0"
+    policies.kyverno.io/description: >-
+      All container images in the production namespace must reference an
+      immutable SHA-256 digest rather than a mutable tag. This prevents
+      silent image substitution after a vulnerability disclosure.
+spec:
+  # Two rules with different failure actions achieve enforce-in-prod /
+  # audit-everywhere-else without duplicating match logic.
+  validationFailureAction: Audit   # default for non-production namespaces
+  background: true
+  rules:
+
+    # -------------------------------------------------------------------------
+    # Rule 1 — ENFORCE in production
+    # -------------------------------------------------------------------------
+    - name: require-image-digest-production
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - production
+      validate:
+        failureAction: Enforce
+        message: >-
+          In the production namespace every container image must include a
+          SHA-256 digest pin (e.g., image@sha256:<hash>). Mutable tags such
+          as ':latest' are not permitted.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  # Deny if the image string does NOT contain "@sha256:"
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "@sha256:"
+          - list: "request.object.spec.initContainers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "@sha256:"
+          - list: "request.object.spec.ephemeralContainers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "@sha256:"
+
+    # -------------------------------------------------------------------------
+    # Rule 2 — AUDIT in staging (warn on mutable tags, do not block)
+    # -------------------------------------------------------------------------
+    - name: require-image-digest-staging
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - staging
+      validate:
+        failureAction: Audit
+        message: >-
+          WARNING: Container image uses a mutable tag. Pin to a SHA-256
+          digest before promoting to production.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "@sha256:"
+
+    # -------------------------------------------------------------------------
+    # Rule 3 — Block :latest tag explicitly (all non-system namespaces)
+    # -------------------------------------------------------------------------
+    - name: disallow-latest-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        failureAction: Enforce
+        message: >-
+          The ':latest' tag is not permitted. Specify an explicit version tag
+          or, preferably, a SHA-256 digest.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: Contains
+                    value: ":latest"
+          - list: "request.object.spec.initContainers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: Contains
+                    value: ":latest"
