@@ -1,0 +1,289 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: logging
+  labels:
+    app.kubernetes.io/name: fluent-bit
+    app.kubernetes.io/component: log-shipper
+    app.kubernetes.io/part-of: observability-stack
+data:
+  # ------------------------------------------------------------------
+  # Main configuration
+  # ------------------------------------------------------------------
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush               5
+        Daemon              Off
+        Log_Level           info
+        Parsers_File        parsers.conf
+        Parsers_File        custom-parsers.conf
+        HTTP_Server         On
+        HTTP_Listen         0.0.0.0
+        HTTP_Port           2020
+        Health_Check        On
+        HC_Errors_Count     5
+        HC_Retry_Failure_Count 5
+        HC_Period           60
+        storage.path        /var/fluent-bit/state/flb-storage/
+        storage.sync        normal
+        storage.checksum    off
+        storage.max_chunks_up 128
+
+    # ------------------------------------------------------------------
+    # INPUT: Tail container logs from all nodes
+    # ------------------------------------------------------------------
+    [INPUT]
+        Name                tail
+        Tag                 kube.*
+        Path                /var/log/containers/*.log
+        Exclude_Path        /var/log/containers/fluent-bit*,/var/log/containers/cloudwatch-agent*
+        Parser              cri
+        DB                  /var/fluent-bit/state/flb_kube.db
+        Mem_Buf_Limit       50MB
+        Skip_Long_Lines     On
+        Refresh_Interval    10
+        Rotate_Wait         30
+        storage.type        filesystem
+        Read_from_Head      False
+
+    # ------------------------------------------------------------------
+    # INPUT: systemd/kernel logs from host
+    # ------------------------------------------------------------------
+    [INPUT]
+        Name                systemd
+        Tag                 host.*
+        Systemd_Filter      _SYSTEMD_UNIT=kubelet.service
+        Systemd_Filter      _SYSTEMD_UNIT=docker.service
+        Systemd_Filter      _SYSTEMD_UNIT=containerd.service
+        DB                  /var/fluent-bit/state/flb_systemd.db
+        Strip_Underscores   Off
+        storage.type        filesystem
+
+    # ------------------------------------------------------------------
+    # FILTER: Kubernetes metadata enrichment
+    # ------------------------------------------------------------------
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Kube_Tag_Prefix     kube.var.log.containers.
+        Merge_Log           On
+        Merge_Log_Key       log_processed
+        Merge_Log_Trim      On
+        Keep_Log            Off
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+        Annotations         Off
+        Labels              On
+        Buffer_Size         0
+        Cache_Use_Docker_Id True
+        Regex_Parser        k8s-fullpath
+
+    # ------------------------------------------------------------------
+    # FILTER: Add cluster name and environment labels
+    # ------------------------------------------------------------------
+    [FILTER]
+        Name                record_modifier
+        Match               kube.*
+        Record              cluster aks-prod
+        Record              environment production
+        Record              region eastus
+        Record              log_type kubernetes
+
+    [FILTER]
+        Name                record_modifier
+        Match               host.*
+        Record              cluster aks-prod
+        Record              environment production
+        Record              log_type host
+
+    # ------------------------------------------------------------------
+    # FILTER: Parse JSON log bodies (for structured application logs)
+    # ------------------------------------------------------------------
+    [FILTER]
+        Name                parser
+        Match               kube.*
+        Key_Name            log
+        Parser              json
+        Reserve_Data        True
+        Preserve_Key        True
+
+    # ------------------------------------------------------------------
+    # FILTER: Nest/lift fields for Loki label compatibility
+    # ------------------------------------------------------------------
+    [FILTER]
+        Name                nest
+        Match               kube.*
+        Operation           lift
+        Nested_under        kubernetes
+        Add_prefix          k8s_
+
+    # ------------------------------------------------------------------
+    # FILTER: Exclude health check / liveness probe logs (noise reduction)
+    # ------------------------------------------------------------------
+    [FILTER]
+        Name                grep
+        Match               kube.*
+        Exclude             log .*GET /health.*
+        Exclude             log .*GET /healthz.*
+        Exclude             log .*GET /readyz.*
+        Exclude             log .*GET /livez.*
+        Exclude             log .*GET /ping.*
+        Exclude             log .*HEAD / HTTP.*
+        Exclude             log .*kube-probe.*
+
+    # ------------------------------------------------------------------
+    # FILTER: Exclude noisy system namespaces from verbose debug logs
+    # ------------------------------------------------------------------
+    [FILTER]
+        Name                grep
+        Match               kube.*
+        Exclude             k8s_namespace_name kube-system|kube-public|cert-manager
+        Logical_Op          or
+
+    # ------------------------------------------------------------------
+    # FILTER: Modify log levels to normalized format
+    # ------------------------------------------------------------------
+    [FILTER]
+        Name                lua
+        Match               kube.*
+        script              /fluent-bit/scripts/normalize_level.lua
+        call                normalize_log_level
+
+    # ------------------------------------------------------------------
+    # OUTPUT: Loki (primary log aggregation)
+    # ------------------------------------------------------------------
+    [OUTPUT]
+        Name                loki
+        Match               kube.*
+        Host                loki-gateway.logging.svc.cluster.local
+        Port                80
+        Labels              job=fluentbit, app=$k8s_labels_app, namespace=$k8s_namespace_name, pod=$k8s_pod_name, container=$k8s_container_name, node=$k8s_host, cluster=aks-prod, environment=production
+        Label_Keys          level,severity,log_level
+        Remove_Keys         k8s_labels_app,k8s_pod_name,k8s_namespace_name,k8s_container_name,k8s_host
+        Line_Format         json
+        Auto_Kubernetes_Labels Off
+        Tenant_ID           default
+        TLS                 Off
+        http_user           ${LOKI_USER}
+        http_passwd         ${LOKI_PASSWORD}
+        Retry_Limit         5
+        Workers             2
+
+    # ------------------------------------------------------------------
+    # OUTPUT: Loki for host/systemd logs
+    # ------------------------------------------------------------------
+    [OUTPUT]
+        Name                loki
+        Match               host.*
+        Host                loki-gateway.logging.svc.cluster.local
+        Port                80
+        Labels              job=fluentbit-host, log_type=host, cluster=aks-prod, environment=production
+        Line_Format         json
+        Tenant_ID           default
+        Retry_Limit         5
+
+    # ------------------------------------------------------------------
+    # OUTPUT: Azure Log Analytics (SIEM integration)
+    # ------------------------------------------------------------------
+    [OUTPUT]
+        Name                azure
+        Match               kube.*
+        Customer_ID         ${AZURE_LOG_ANALYTICS_WORKSPACE_ID}
+        Shared_Key          ${AZURE_LOG_ANALYTICS_SHARED_KEY}
+        Log_Type            KubernetesContainerLogs
+        Time_Key            @timestamp
+        Time_Generated      On
+        Compress            True
+        Workers             2
+
+    # Security & audit logs forwarded to a dedicated Log Analytics table
+    [OUTPUT]
+        Name                azure
+        Match               kube.*falco*
+        Customer_ID         ${AZURE_LOG_ANALYTICS_WORKSPACE_ID}
+        Shared_Key          ${AZURE_LOG_ANALYTICS_SHARED_KEY}
+        Log_Type            FalcoSecurityEvents
+        Time_Key            @timestamp
+        Time_Generated      On
+
+    # ------------------------------------------------------------------
+    # OUTPUT: Prometheus metrics (Fluent Bit internal metrics)
+    # ------------------------------------------------------------------
+    [OUTPUT]
+        Name                prometheus_exporter
+        Match               internal_metrics
+        Host                0.0.0.0
+        Port                2021
+
+  # ------------------------------------------------------------------
+  # Custom parsers
+  # ------------------------------------------------------------------
+  custom-parsers.conf: |
+    [PARSER]
+        Name                k8s-fullpath
+        Format              regex
+        Regex               ^(?<namespace_name>[^_]+)_(?<pod_name>[^_]+)_(?<docker_id>[a-z0-9\-]+)$
+
+    [PARSER]
+        Name                json
+        Format              json
+        Time_Key            time
+        Time_Format         %Y-%m-%dT%H:%M:%S.%LZ
+        Time_Keep           Off
+        Decode_Field_As     escaped_utf8 log do_next
+        Decode_Field_As     json log
+
+    [PARSER]
+        Name                cri
+        Format              regex
+        Regex               ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<log>.*)$
+        Time_Key            time
+        Time_Format         %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep           False
+
+    [PARSER]
+        Name                docker
+        Format              json
+        Time_Key            time
+        Time_Format         %Y-%m-%dT%H:%M:%S.%LZ
+        Time_Keep           False
+        Decode_Field_As     escaped_utf8 log do_next
+        Decode_Field_As     json log
+
+    [PARSER]
+        Name                syslog
+        Format              regex
+        Regex               ^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$
+        Time_Key            time
+        Time_Format         %b %d %H:%M:%S
+
+  # ------------------------------------------------------------------
+  # Lua script for log level normalization
+  # ------------------------------------------------------------------
+  normalize_level.lua: |
+    function normalize_log_level(tag, timestamp, record)
+        local level = record["level"] or record["severity"] or record["log_level"] or record["loglevel"] or ""
+        level = string.lower(level)
+
+        if level == "fatal" or level == "panic" or level == "emerg" then
+            record["level"] = "critical"
+        elseif level == "error" or level == "err" then
+            record["level"] = "error"
+        elseif level == "warn" or level == "warning" then
+            record["level"] = "warn"
+        elseif level == "info" or level == "information" or level == "notice" then
+            record["level"] = "info"
+        elseif level == "debug" or level == "trace" or level == "verbose" then
+            record["level"] = "debug"
+        elseif level ~= "" then
+            -- keep original if unrecognized
+            record["level"] = level
+        end
+
+        return 1, timestamp, record
+    end
