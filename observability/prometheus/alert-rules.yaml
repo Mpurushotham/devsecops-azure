@@ -1,0 +1,600 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: observability-alert-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: alert-rules
+    app.kubernetes.io/part-of: observability-stack
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    # ===========================================================
+    # Security Alerts
+    # ===========================================================
+    - name: security-alerts
+      interval: 30s
+      rules:
+
+        # Falco critical runtime security event
+        - alert: FalcoCriticalAlert
+          expr: |
+            increase(falco_events_total{priority="CRITICAL"}[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            team: security
+            category: runtime-security
+          annotations:
+            summary: "Falco detected a CRITICAL security event"
+            description: >
+              Falco has detected a CRITICAL priority security event in namespace
+              {{ $labels.namespace }} on node {{ $labels.node }}.
+              Rule triggered: {{ $labels.rule }}.
+              Immediate investigation required.
+            runbook_url: "https://wiki.internal/runbooks/falco-critical"
+            dashboard_url: "https://grafana.internal/d/security-overview"
+
+        # Falco high-priority security event
+        - alert: FalcoHighAlert
+          expr: |
+            increase(falco_events_total{priority="HIGH"}[5m]) > 3
+          for: 2m
+          labels:
+            severity: warning
+            team: security
+            category: runtime-security
+          annotations:
+            summary: "Falco detected multiple HIGH priority security events"
+            description: >
+              Falco has detected {{ $value }} HIGH priority security events in the
+              last 5 minutes in namespace {{ $labels.namespace }}.
+              Rule: {{ $labels.rule }}. Investigate promptly.
+            runbook_url: "https://wiki.internal/runbooks/falco-high"
+
+        # TLS certificate expiring soon
+        - alert: CertificateExpiringSoon
+          expr: |
+            (x509_cert_expiry - time()) / 86400 < 14
+          for: 1h
+          labels:
+            severity: warning
+            team: platform
+            category: certificate
+          annotations:
+            summary: "TLS certificate expiring in less than 14 days"
+            description: >
+              Certificate for {{ $labels.subject_common_name }} (issuer: {{ $labels.issuer_common_name }})
+              expires in {{ $value | humanizeDuration }}. Namespace: {{ $labels.namespace }}.
+              Certificate subject: {{ $labels.subject_common_name }}.
+            runbook_url: "https://wiki.internal/runbooks/certificate-renewal"
+
+        - alert: CertificateExpiryCritical
+          expr: |
+            (x509_cert_expiry - time()) / 86400 < 3
+          for: 0m
+          labels:
+            severity: critical
+            team: platform
+            category: certificate
+          annotations:
+            summary: "TLS certificate expiring in less than 3 days — CRITICAL"
+            description: >
+              Certificate for {{ $labels.subject_common_name }} expires in
+              {{ $value | humanizeDuration }}. IMMEDIATE renewal required.
+            runbook_url: "https://wiki.internal/runbooks/certificate-renewal"
+
+        # Unauthorized API access (audit log anomalies)
+        - alert: UnauthorizedAPIAccess
+          expr: |
+            sum by (user, verb, resource, namespace) (
+              increase(apiserver_audit_event_total{
+                objectRef_namespace!="",
+                annotations_authorization_k8s_io_decision="forbid"
+              }[5m])
+            ) > 10
+          for: 2m
+          labels:
+            severity: warning
+            team: security
+            category: access-control
+          annotations:
+            summary: "High rate of unauthorized Kubernetes API access attempts"
+            description: >
+              User {{ $labels.user }} has had {{ $value }} forbidden API calls in the
+              last 5 minutes. Verb: {{ $labels.verb }}, Resource: {{ $labels.resource }},
+              Namespace: {{ $labels.namespace }}. Possible misconfiguration or intrusion attempt.
+            runbook_url: "https://wiki.internal/runbooks/unauthorized-api"
+
+        - alert: UnauthorizedAPIAccessCritical
+          expr: |
+            sum by (user, verb, resource) (
+              increase(apiserver_audit_event_total{
+                annotations_authorization_k8s_io_decision="forbid",
+                objectRef_resource=~"secrets|clusterrolebindings|rolebindings"
+              }[5m])
+            ) > 3
+          for: 0m
+          labels:
+            severity: critical
+            team: security
+            category: access-control
+          annotations:
+            summary: "Unauthorized access to sensitive Kubernetes resources detected"
+            description: >
+              {{ $value }} unauthorized attempts to access {{ $labels.resource }} by
+              user {{ $labels.user }} in the last 5 minutes. This may indicate a
+              privilege escalation attempt.
+            runbook_url: "https://wiki.internal/runbooks/unauthorized-api-critical"
+
+        # High CVSS vulnerability detected
+        - alert: HighCVSSVulnerabilityDetected
+          expr: |
+            sum by (image, namespace, severity) (
+              container_image_vulnerabilities{severity=~"CRITICAL|HIGH", fixed="true"}
+            ) > 0
+          for: 6h
+          labels:
+            severity: warning
+            team: security
+            category: vulnerability
+          annotations:
+            summary: "Container image with HIGH/CRITICAL fixable vulnerability detected"
+            description: >
+              Container image {{ $labels.image }} in namespace {{ $labels.namespace }}
+              has {{ $value }} {{ $labels.severity }} severity vulnerabilities with
+              available fixes. Image should be updated immediately.
+            runbook_url: "https://wiki.internal/runbooks/vulnerability-remediation"
+
+        - alert: CriticalCVSSVulnerabilityInProduction
+          expr: |
+            sum by (image, namespace) (
+              container_image_vulnerabilities{
+                severity="CRITICAL",
+                fixed="true",
+                namespace=~"production|prod.*"
+              }
+            ) > 0
+          for: 1h
+          labels:
+            severity: critical
+            team: security
+            category: vulnerability
+          annotations:
+            summary: "CRITICAL fixable vulnerability in production container image"
+            description: >
+              Production image {{ $labels.image }} has {{ $value }} CRITICAL CVEs with
+              available patches. Remediation required within SLA window.
+            runbook_url: "https://wiki.internal/runbooks/vulnerability-remediation"
+
+        # Privileged container started
+        - alert: PrivilegedContainerStarted
+          expr: |
+            kube_pod_container_info{container!=""} * on(pod, namespace)
+            group_left()
+            (kube_pod_spec_containers_securitycontext_privileged == 1)
+          for: 0m
+          labels:
+            severity: critical
+            team: security
+            category: pod-security
+          annotations:
+            summary: "Privileged container started in namespace {{ $labels.namespace }}"
+            description: >
+              A privileged container {{ $labels.container }} in pod {{ $labels.pod }}
+              (namespace: {{ $labels.namespace }}) is running. Privileged containers
+              bypass most container security restrictions.
+            runbook_url: "https://wiki.internal/runbooks/privileged-container"
+
+    # ===========================================================
+    # SLO Alerts
+    # ===========================================================
+    - name: slo-alerts
+      interval: 30s
+      rules:
+
+        # High error rate (> 1% for 5 minutes)
+        - alert: HighErrorRate
+          expr: |
+            sum by (namespace, service, job) (
+              rate(http_requests_total{status_code=~"5.."}[5m])
+            )
+            /
+            sum by (namespace, service, job) (
+              rate(http_requests_total[5m])
+            ) > 0.01
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            category: slo
+            slo: error-rate
+          annotations:
+            summary: "Error rate above 1% SLO threshold for {{ $labels.service }}"
+            description: >
+              Service {{ $labels.service }} in namespace {{ $labels.namespace }} has
+              an error rate of {{ $value | humanizePercentage }} over the last 5 minutes,
+              exceeding the 1% SLO threshold.
+            runbook_url: "https://wiki.internal/runbooks/high-error-rate"
+            dashboard_url: "https://grafana.internal/d/slo-dashboard"
+
+        - alert: CriticalErrorRate
+          expr: |
+            sum by (namespace, service, job) (
+              rate(http_requests_total{status_code=~"5.."}[5m])
+            )
+            /
+            sum by (namespace, service, job) (
+              rate(http_requests_total[5m])
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            category: slo
+            slo: error-rate
+          annotations:
+            summary: "CRITICAL: Error rate above 5% for {{ $labels.service }}"
+            description: >
+              Service {{ $labels.service }} in namespace {{ $labels.namespace }} has
+              an error rate of {{ $value | humanizePercentage }}. This severely impacts
+              user experience and must be resolved immediately.
+            runbook_url: "https://wiki.internal/runbooks/critical-error-rate"
+
+        # High latency (p99 > 500ms for 10 minutes)
+        - alert: HighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum by (namespace, service, le) (
+                rate(http_request_duration_seconds_bucket[10m])
+              )
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+            category: slo
+            slo: latency
+          annotations:
+            summary: "P99 latency above 500ms SLO for {{ $labels.service }}"
+            description: >
+              P99 request latency for service {{ $labels.service }} in namespace
+              {{ $labels.namespace }} is {{ $value | humanizeDuration }}, exceeding
+              the 500ms SLO threshold for 10 minutes.
+            runbook_url: "https://wiki.internal/runbooks/high-latency"
+            dashboard_url: "https://grafana.internal/d/slo-dashboard"
+
+        - alert: CriticalLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum by (namespace, service, le) (
+                rate(http_request_duration_seconds_bucket[10m])
+              )
+            ) > 2.0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            category: slo
+            slo: latency
+          annotations:
+            summary: "CRITICAL: P99 latency above 2s for {{ $labels.service }}"
+            description: >
+              P99 request latency for service {{ $labels.service }} is
+              {{ $value | humanizeDuration }}. Users are experiencing severe degradation.
+            runbook_url: "https://wiki.internal/runbooks/critical-latency"
+
+        # Service availability below 99.9%
+        - alert: ServiceAvailabilityLow
+          expr: |
+            (
+              sum by (namespace, service) (
+                rate(http_requests_total{status_code!~"5.."}[30m])
+              )
+              /
+              sum by (namespace, service) (
+                rate(http_requests_total[30m])
+              )
+            ) < 0.999
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            category: slo
+            slo: availability
+          annotations:
+            summary: "Service availability below 99.9% SLO for {{ $labels.service }}"
+            description: >
+              Service {{ $labels.service }} in namespace {{ $labels.namespace }} has
+              availability of {{ $value | humanizePercentage }}, below the 99.9% SLO
+              target. Error budget is being consumed rapidly.
+            runbook_url: "https://wiki.internal/runbooks/service-availability"
+            dashboard_url: "https://grafana.internal/d/slo-dashboard"
+
+        # Error budget burn rate (fast burn — 14.4x in 1h consuming 2% of monthly budget)
+        - alert: ErrorBudgetFastBurn
+          expr: |
+            (
+              sum by (namespace, service) (
+                rate(http_requests_total{status_code=~"5.."}[1h])
+              )
+              /
+              sum by (namespace, service) (
+                rate(http_requests_total[1h])
+              )
+            ) > (14.4 * 0.001)
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            category: slo
+            slo: error-budget
+            burn_type: fast
+          annotations:
+            summary: "Fast error budget burn rate for {{ $labels.service }}"
+            description: >
+              Service {{ $labels.service }} is burning error budget at 14.4x the
+              sustainable rate. At this rate, the monthly error budget will be exhausted
+              in ~5 hours.
+            runbook_url: "https://wiki.internal/runbooks/error-budget-burn"
+
+        # Error budget burn rate (slow burn — 3x in 6h consuming 5% of monthly budget)
+        - alert: ErrorBudgetSlowBurn
+          expr: |
+            (
+              sum by (namespace, service) (
+                rate(http_requests_total{status_code=~"5.."}[6h])
+              )
+              /
+              sum by (namespace, service) (
+                rate(http_requests_total[6h])
+              )
+            ) > (3 * 0.001)
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            category: slo
+            slo: error-budget
+            burn_type: slow
+          annotations:
+            summary: "Slow error budget burn rate for {{ $labels.service }}"
+            description: >
+              Service {{ $labels.service }} is burning error budget at 3x the
+              sustainable rate over 6 hours. Monitor closely to prevent SLO breach.
+            runbook_url: "https://wiki.internal/runbooks/error-budget-burn"
+
+    # ===========================================================
+    # Infrastructure Alerts
+    # ===========================================================
+    - name: infra-alerts
+      interval: 30s
+      rules:
+
+        # Node memory pressure
+        - alert: NodeMemoryPressure
+          expr: |
+            (
+              node_memory_MemAvailable_bytes
+              /
+              node_memory_MemTotal_bytes
+            ) < 0.10
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            category: infrastructure
+          annotations:
+            summary: "Node {{ $labels.node }} memory pressure — less than 10% available"
+            description: >
+              Node {{ $labels.node }} has only {{ $value | humanizePercentage }} of
+              memory available ({{ $labels.instance }}). Pods may be evicted soon.
+              Available: {{ with query "node_memory_MemAvailable_bytes{instance='" }}{{ . | first | value | humanize1024 }}{{ end }}B
+            runbook_url: "https://wiki.internal/runbooks/node-memory-pressure"
+
+        - alert: NodeMemoryCritical
+          expr: |
+            (
+              node_memory_MemAvailable_bytes
+              /
+              node_memory_MemTotal_bytes
+            ) < 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            category: infrastructure
+          annotations:
+            summary: "CRITICAL: Node {{ $labels.node }} memory critically low (< 5%)"
+            description: >
+              Node {{ $labels.node }} has less than 5% memory available. OOM kills
+              are imminent. Immediate action required.
+            runbook_url: "https://wiki.internal/runbooks/node-memory-critical"
+
+        # Node CPU throttling
+        - alert: NodeCPUThrottle
+          expr: |
+            sum by (node, namespace, pod, container) (
+              increase(container_cpu_cfs_throttled_seconds_total[5m])
+            )
+            /
+            sum by (node, namespace, pod, container) (
+              increase(container_cpu_cfs_periods_total[5m])
+            ) > 0.25
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            category: infrastructure
+          annotations:
+            summary: "CPU throttling above 25% for {{ $labels.container }} in {{ $labels.namespace }}"
+            description: >
+              Container {{ $labels.container }} in pod {{ $labels.pod }}
+              (namespace: {{ $labels.namespace }}, node: {{ $labels.node }}) is being
+              CPU throttled {{ $value | humanizePercentage }} of the time. Consider
+              increasing CPU limits.
+            runbook_url: "https://wiki.internal/runbooks/cpu-throttling"
+
+        - alert: NodeCPUThrottleCritical
+          expr: |
+            sum by (node, namespace, pod, container) (
+              increase(container_cpu_cfs_throttled_seconds_total[5m])
+            )
+            /
+            sum by (node, namespace, pod, container) (
+              increase(container_cpu_cfs_periods_total[5m])
+            ) > 0.75
+          for: 10m
+          labels:
+            severity: critical
+            team: platform
+            category: infrastructure
+          annotations:
+            summary: "CRITICAL: CPU throttling above 75% for {{ $labels.container }}"
+            description: >
+              Container {{ $labels.container }} (pod: {{ $labels.pod }}, namespace:
+              {{ $labels.namespace }}) is being CPU throttled {{ $value | humanizePercentage }}
+              of the time — severe performance degradation.
+            runbook_url: "https://wiki.internal/runbooks/cpu-throttling-critical"
+
+        # Persistent Volume filling up
+        - alert: PersistentVolumeFillingUp
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes
+              /
+              kubelet_volume_stats_capacity_bytes
+            ) > 0.80
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            category: storage
+          annotations:
+            summary: "PersistentVolume {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+            description: >
+              PersistentVolumeClaim {{ $labels.persistentvolumeclaim }} in namespace
+              {{ $labels.namespace }} is {{ $value | humanizePercentage }} full.
+              Used: {{ with query "kubelet_volume_stats_used_bytes" }}{{ . | first | value | humanize1024 }}{{ end }}B.
+              Expand the PVC or clean up data.
+            runbook_url: "https://wiki.internal/runbooks/pvc-filling"
+
+        - alert: PersistentVolumeFillingUpCritical
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes
+              /
+              kubelet_volume_stats_capacity_bytes
+            ) > 0.95
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            category: storage
+          annotations:
+            summary: "CRITICAL: PersistentVolume {{ $labels.persistentvolumeclaim }} almost full (> 95%)"
+            description: >
+              PVC {{ $labels.persistentvolumeclaim }} in namespace {{ $labels.namespace }}
+              is {{ $value | humanizePercentage }} full. Application may crash when disk
+              is completely full. Immediate expansion required.
+            runbook_url: "https://wiki.internal/runbooks/pvc-critical"
+
+        # Predicted PVC full within 24h (using linear prediction)
+        - alert: PersistentVolumeFillingUpPredicted
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes
+              /
+              kubelet_volume_stats_capacity_bytes
+            ) > 0.70
+            and
+            predict_linear(kubelet_volume_stats_used_bytes[6h], 24 * 3600)
+            >
+            kubelet_volume_stats_capacity_bytes
+          for: 60m
+          labels:
+            severity: warning
+            team: platform
+            category: storage
+          annotations:
+            summary: "PVC {{ $labels.persistentvolumeclaim }} predicted to fill up within 24 hours"
+            description: >
+              Based on current usage trend, PVC {{ $labels.persistentvolumeclaim }}
+              in namespace {{ $labels.namespace }} will be full within 24 hours.
+              Plan for expansion proactively.
+            runbook_url: "https://wiki.internal/runbooks/pvc-prediction"
+
+        # Node not ready
+        - alert: NodeNotReady
+          expr: |
+            kube_node_status_condition{condition="Ready", status="true"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            category: infrastructure
+          annotations:
+            summary: "Kubernetes node {{ $labels.node }} is not Ready"
+            description: >
+              Node {{ $labels.node }} has been in a NotReady state for more than 5
+              minutes. Pods on this node will not be scheduled and existing pods may
+              be evicted.
+            runbook_url: "https://wiki.internal/runbooks/node-not-ready"
+
+        # Pod crash looping
+        - alert: PodCrashLooping
+          expr: |
+            sum by (namespace, pod, container) (
+              increase(kube_pod_container_status_restarts_total[15m])
+            ) > 3
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            category: pod-health
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash looping in {{ $labels.namespace }}"
+            description: >
+              Container {{ $labels.container }} in pod {{ $labels.pod }} (namespace:
+              {{ $labels.namespace }}) has restarted {{ $value }} times in the last
+              15 minutes. Check pod logs for root cause.
+            runbook_url: "https://wiki.internal/runbooks/pod-crash-loop"
+
+        # Deployment replicas unavailable
+        - alert: DeploymentReplicasUnavailable
+          expr: |
+            kube_deployment_status_replicas_unavailable > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+            category: workload
+          annotations:
+            summary: "Deployment {{ $labels.deployment }} has unavailable replicas"
+            description: >
+              Deployment {{ $labels.deployment }} in namespace {{ $labels.namespace }}
+              has {{ $value }} unavailable replica(s) for more than 10 minutes.
+            runbook_url: "https://wiki.internal/runbooks/deployment-replicas"
+
+        # etcd high latency
+        - alert: EtcdHighFsyncDurations
+          expr: |
+            histogram_quantile(0.99,
+              rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+            category: etcd
+          annotations:
+            summary: "etcd WAL fsync p99 latency is high ({{ $value | humanizeDuration }})"
+            description: >
+              etcd WAL fsync p99 latency on {{ $labels.instance }} is
+              {{ $value | humanizeDuration }}, exceeding 500ms. This may indicate
+              disk pressure or etcd performance degradation.
+            runbook_url: "https://wiki.internal/runbooks/etcd-fsync"
