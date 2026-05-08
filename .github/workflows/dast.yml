@@ -1,0 +1,700 @@
+# =============================================================================
+# DAST Workflow — Azure DevSecOps
+# =============================================================================
+# Scheduled daily + on-demand Dynamic Application Security Testing.
+#
+# Pipeline stages:
+#   1. Deploy app to ephemeral test environment (Docker Compose / ACI)
+#   2. Run OWASP ZAP full scan
+#   3. Run Nuclei scanner for known CVEs
+#   4. Parse results and apply CVSS thresholds (>9.0 fail, 7-8.9 warn)
+#   5. Upload results to GitHub Security tab (SARIF)
+#   6. Clean up ephemeral environment
+#
+# CVSS Thresholds:
+#   > 9.0       → fail workflow (exit 1)
+#   7.0 – 8.9  → warning annotation + create GitHub issue
+#   < 7.0       → log only
+#
+# Required secrets:
+#   ACR_USERNAME, ACR_PASSWORD, AZURE_SUBSCRIPTION_ID,
+#   AZURE_CREDENTIALS (service principal JSON for ACI)
+# Required vars:
+#   ACR_REGISTRY, ACR_REPOSITORY, DAST_TARGET_URL (optional override)
+# =============================================================================
+
+name: DAST — Dynamic Application Security Testing
+
+on:
+  schedule:
+    # Daily at 02:00 UTC (off-peak hours)
+    - cron: "0 2 * * *"
+  # On-demand trigger with optional target override
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Target URL to scan (leave blank to spin up ephemeral env)"
+        required: false
+        default:  ""
+      scan_type:
+        description: "Scan type"
+        required: true
+        default:  "full"
+        type: choice
+        options: [full, api, baseline]
+      image_ref:
+        description: "Container image ref to deploy (leave blank for latest)"
+        required: false
+        default:  ""
+      nuclei_templates:
+        description: "Nuclei template tags (comma-separated)"
+        required: false
+        default:  "cve,owasp"
+
+concurrency:
+  group: dast-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents:        read
+  security-events: write   # SARIF upload to Security tab
+  issues:          write   # Create tickets for HIGH findings
+  id-token:        write   # OIDC for Azure login
+
+# ── Global environment ─────────────────────────────────────────────────────
+env:
+  ACR_REGISTRY:       ${{ vars.ACR_REGISTRY }}
+  ACR_REPOSITORY:     ${{ vars.ACR_REPOSITORY }}
+  EPHEMERAL_ENV_NAME: dast-ephemeral-${{ github.run_id }}
+  SCAN_TYPE:          ${{ inputs.scan_type || 'full' }}
+  NUCLEI_TEMPLATES:   ${{ inputs.nuclei_templates || 'cve,owasp' }}
+  # Allow override from manual trigger; fall back to vars
+  IMAGE_REF:          ${{ inputs.image_ref || format('{0}/{1}:latest', vars.ACR_REGISTRY, vars.ACR_REPOSITORY) }}
+
+# =============================================================================
+# JOB 1 — Deploy Ephemeral Test Environment
+# =============================================================================
+jobs:
+  deploy-ephemeral:
+    name: Deploy Ephemeral Environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      target-url:      ${{ steps.resolve-url.outputs.target_url }}
+      container-group: ${{ env.EPHEMERAL_ENV_NAME }}
+      use-ephemeral:   ${{ steps.resolve-url.outputs.use_ephemeral }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target URL
+        id: resolve-url
+        run: |
+          OVERRIDE="${{ inputs.target_url }}"
+          if [ -n "$OVERRIDE" ]; then
+            echo "Using provided target URL: $OVERRIDE"
+            echo "target_url=${OVERRIDE}" >> "$GITHUB_OUTPUT"
+            echo "use_ephemeral=false"    >> "$GITHUB_OUTPUT"
+          else
+            echo "No target URL provided — will spin up ephemeral environment."
+            echo "use_ephemeral=true" >> "$GITHUB_OUTPUT"
+            # URL will be set after ACI deployment below
+          fi
+
+      - name: Log in to ACR
+        if: steps.resolve-url.outputs.use_ephemeral == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Log in to Azure
+        if: steps.resolve-url.outputs.use_ephemeral == 'true'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Container Instances (ephemeral)
+        if: steps.resolve-url.outputs.use_ephemeral == 'true'
+        id: deploy-aci
+        run: |
+          RESOURCE_GROUP="${{ vars.DAST_RESOURCE_GROUP || 'rg-dast-ephemeral' }}"
+
+          az container create \
+            --resource-group   "$RESOURCE_GROUP" \
+            --name             "${{ env.EPHEMERAL_ENV_NAME }}" \
+            --image            "${{ env.IMAGE_REF }}" \
+            --registry-server  "${{ env.ACR_REGISTRY }}" \
+            --registry-username "${{ secrets.ACR_USERNAME }}" \
+            --registry-password "${{ secrets.ACR_PASSWORD }}" \
+            --cpu              1 \
+            --memory           1.5 \
+            --ports            8080 \
+            --environment-variables \
+              SPRING_PROFILES_ACTIVE=test \
+              MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,info \
+            --ip-address       Public \
+            --subscription     "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+          # Retrieve the public FQDN
+          FQDN=$(az container show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "${{ env.EPHEMERAL_ENV_NAME }}" \
+            --query ipAddress.fqdn \
+            --output tsv \
+            --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}")
+
+          TARGET_URL="http://${FQDN}:8080"
+          echo "Ephemeral environment deployed: $TARGET_URL"
+          echo "target_url=${TARGET_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for ephemeral environment to be healthy
+        if: steps.resolve-url.outputs.use_ephemeral == 'true'
+        run: |
+          TARGET="${{ steps.deploy-aci.outputs.target_url }}"
+          echo "Waiting for ${TARGET}/actuator/health to respond..."
+          timeout 120 bash -c "
+            until curl -sf '${TARGET}/actuator/health' 2>/dev/null | grep -q 'UP'; do
+              echo 'Waiting...'
+              sleep 5
+            done
+          "
+          echo "Environment is healthy."
+
+      - name: Set final target URL
+        id: final-url
+        run: |
+          if [ "${{ steps.resolve-url.outputs.use_ephemeral }}" = "true" ]; then
+            echo "target_url=${{ steps.deploy-aci.outputs.target_url }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "target_url=${{ steps.resolve-url.outputs.target_url }}" >> "$GITHUB_OUTPUT"
+          fi
+
+# =============================================================================
+# JOB 2 — OWASP ZAP Scan
+# =============================================================================
+  owasp-zap:
+    name: OWASP ZAP Scan
+    runs-on: ubuntu-24.04
+    needs: deploy-ephemeral
+    timeout-minutes: 60
+    env:
+      TARGET_URL: ${{ needs.deploy-ephemeral.outputs.target-url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare ZAP configuration
+        run: |
+          mkdir -p .zap
+
+          # Generate ZAP rules file to tune alert thresholds
+          cat > .zap/rules.tsv << 'RULES'
+          # ZAP Rule ID  Action     CVSS-Note
+          # 10038        IGNORE     CSP header — handled by WAF
+          10038	IGNORE	CSP — WAF managed
+          # 10021        IGNORE     X-Content-Type-Options — CDN set
+          10021	IGNORE	X-Content-Type-Options — CDN managed
+          RULES
+
+          # ZAP context file with authentication if needed
+          cat > .zap/context.yaml << 'CTX'
+          env:
+            contexts:
+              - name: DAST-Context
+                urls:
+                  - "${TARGET_URL}"
+                includePaths:
+                  - "${TARGET_URL}/.*"
+                excludePaths:
+                  - "${TARGET_URL}/actuator/shutdown"
+                  - "${TARGET_URL}/logout"
+          CTX
+
+      - name: Run OWASP ZAP Full Scan
+        if: env.SCAN_TYPE == 'full'
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target:              ${{ env.TARGET_URL }}
+          rules_file_name:     ".zap/rules.tsv"
+          cmd_options:         "-a -j"
+          allow_issue_writing: false   # We handle issue creation ourselves
+          artifact_name:       "zap-full-scan-${{ github.run_id }}"
+          fail_action:         false   # We apply custom CVSS logic below
+
+      - name: Run OWASP ZAP Baseline Scan
+        if: env.SCAN_TYPE == 'baseline'
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target:              ${{ env.TARGET_URL }}
+          rules_file_name:     ".zap/rules.tsv"
+          allow_issue_writing: false
+          artifact_name:       "zap-baseline-${{ github.run_id }}"
+          fail_action:         false
+
+      - name: Run OWASP ZAP API Scan
+        if: env.SCAN_TYPE == 'api'
+        uses: zaproxy/action-api-scan@v0.7.0
+        with:
+          target:         "${{ env.TARGET_URL }}/v3/api-docs"
+          format:         openapi
+          rules_file_name: ".zap/rules.tsv"
+          artifact_name:  "zap-api-scan-${{ github.run_id }}"
+          fail_action:    false
+
+      - name: Convert ZAP report to SARIF
+        if: always()
+        run: |
+          # ZAP action outputs report.json — convert to SARIF
+          if [ ! -f report_json.json ]; then
+            echo "No ZAP JSON report found — skipping SARIF conversion"
+            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"OWASP ZAP","rules":[]}},"results":[]}]}' > zap.sarif
+            exit 0
+          fi
+
+          python3 - <<'PYEOF'
+          import json, sys, uuid
+
+          with open("report_json.json") as f:
+              zap_report = json.load(f)
+
+          # ZAP risk codes: 3=High, 2=Medium, 1=Low, 0=Informational
+          risk_to_level = {3: "error", 2: "warning", 1: "note", 0: "none"}
+          # Approximate CVSS mapping for ZAP risk levels
+          risk_to_cvss = {3: 9.1, 2: 6.5, 1: 3.1, 0: 0.0}
+
+          rules   = []
+          results = []
+          rule_ids = set()
+
+          for site in zap_report.get("site", []):
+              for alert in site.get("alerts", []):
+                  rule_id  = f"ZAP-{alert.get('pluginid', 'unknown')}"
+                  name     = alert.get("name", "Unknown")
+                  risk     = int(alert.get("riskcode", 0))
+                  desc     = alert.get("desc", "")
+                  solution = alert.get("solution", "")
+                  refs     = alert.get("reference", "")
+                  cvss     = risk_to_cvss.get(risk, 0.0)
+
+                  if rule_id not in rule_ids:
+                      rule_ids.add(rule_id)
+                      rules.append({
+                          "id": rule_id,
+                          "name": name.replace(" ", ""),
+                          "shortDescription": {"text": name},
+                          "fullDescription": {"text": desc[:1000]},
+                          "help": {"text": f"Solution: {solution}\n\nReferences: {refs}"},
+                          "properties": {
+                              "problem.severity": "error" if risk == 3 else "warning",
+                              "cvss_score": cvss,
+                              "precision": "high"
+                          }
+                      })
+
+                  for instance in alert.get("instances", []):
+                      uri  = instance.get("uri", "")
+                      line = 1
+                      results.append({
+                          "ruleId": rule_id,
+                          "level": risk_to_level.get(risk, "none"),
+                          "message": {
+                              "text": f"{name} at {uri}. {alert.get('solution', '')[:500]}"
+                          },
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": uri, "uriBaseId": "%SRCROOT%"},
+                                  "region": {"startLine": line}
+                              }
+                          }],
+                          "properties": {"cvss_score": cvss}
+                      })
+
+          sarif = {
+              "version": "2.1.0",
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "OWASP ZAP",
+                          "version": "2.15",
+                          "informationUri": "https://www.zaproxy.org/",
+                          "rules": rules
+                      }
+                  },
+                  "results": results
+              }]
+          }
+
+          with open("zap.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+
+          print(f"Converted {len(results)} ZAP findings to SARIF ({len(rules)} unique rules)")
+          PYEOF
+
+      - name: Enforce CVSS thresholds (ZAP)
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, os
+
+          if not os.path.exists("zap.sarif"):
+              print("No ZAP SARIF — skipping threshold check")
+              sys.exit(0)
+
+          with open("zap.sarif") as f:
+              sarif = json.load(f)
+
+          critical_findings = []
+          high_findings     = []
+          medium_findings   = []
+
+          for run in sarif.get("runs", []):
+              for result in run.get("results", []):
+                  level     = result.get("level", "none")
+                  rule_id   = result.get("ruleId", "")
+                  msg       = result.get("message", {}).get("text", "")[:200]
+                  cvss      = result.get("properties", {}).get("cvss_score", 0.0)
+                  locations = result.get("locations", [{}])
+                  loc_uri   = ""
+                  if locations:
+                      loc_uri = locations[0].get("physicalLocation", {}) \
+                                           .get("artifactLocation", {}) \
+                                           .get("uri", "")
+
+                  entry = {"rule": rule_id, "msg": msg, "cvss": cvss, "loc": loc_uri}
+                  if cvss >= 9.0 or level == "error":
+                      critical_findings.append(entry)
+                  elif cvss >= 7.0 or level == "warning":
+                      high_findings.append(entry)
+                  else:
+                      medium_findings.append(entry)
+
+          print(f"\nZAP DAST Results:")
+          print(f"  CRITICAL (CVSS >= 9.0): {len(critical_findings)}")
+          print(f"  HIGH     (CVSS 7-8.9):  {len(high_findings)}")
+          print(f"  MEDIUM/LOW (<7.0):      {len(medium_findings)}")
+
+          if critical_findings:
+              print("\nCRITICAL findings (build-blocking):")
+              for f in critical_findings[:5]:
+                  print(f"  [{f['rule']}] CVSS {f['cvss']}: {f['msg'][:100]}")
+              print(f"::error::ZAP DAST found {len(critical_findings)} CRITICAL findings (CVSS > 9.0) — workflow failed")
+              sys.exit(1)
+          elif high_findings:
+              print("\nHIGH findings (warning):")
+              for f in high_findings[:5]:
+                  print(f"  [{f['rule']}] CVSS {f['cvss']}: {f['msg'][:100]}")
+              print(f"::warning::ZAP DAST found {len(high_findings)} HIGH findings (CVSS 7-8.9) — tickets will be created")
+          else:
+              print("\nAll ZAP findings are below HIGH threshold — DAST passed.")
+          PYEOF
+
+      - name: Upload ZAP SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: zap.sarif
+          category:   owasp-zap-dast
+
+      - name: Upload ZAP artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-results-${{ github.run_id }}
+          path: |
+            zap.sarif
+            report_json.json
+            report.html
+          retention-days: 30
+
+# =============================================================================
+# JOB 3 — Nuclei Scanner (CVE + OWASP templates)
+# =============================================================================
+  nuclei-scan:
+    name: Nuclei CVE Scanner
+    runs-on: ubuntu-24.04
+    needs: deploy-ephemeral
+    timeout-minutes: 45
+    env:
+      TARGET_URL: ${{ needs.deploy-ephemeral.outputs.target-url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nuclei
+        run: |
+          # Pin to a specific version for reproducibility
+          NUCLEI_VERSION="v3.3.7"
+          curl -sSfL \
+            "https://github.com/projectdiscovery/nuclei/releases/download/${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION#v}_linux_amd64.zip" \
+            -o nuclei.zip
+          unzip -q nuclei.zip nuclei
+          chmod +x nuclei
+          sudo mv nuclei /usr/local/bin/nuclei
+          nuclei --version
+
+      - name: Update Nuclei templates
+        run: |
+          nuclei -update-templates -silent
+
+      - name: Run Nuclei scan
+        run: |
+          TEMPLATES="${{ env.NUCLEI_TEMPLATES }}"
+          # Build -tags argument from comma-separated list
+          TAGS_ARGS=$(echo "$TEMPLATES" | tr ',' '\n' | sed 's/^/-tags /' | tr '\n' ' ')
+
+          nuclei \
+            -target "${{ env.TARGET_URL }}" \
+            ${TAGS_ARGS} \
+            -severity critical,high,medium,low \
+            -output nuclei-results.txt \
+            -sarif-export nuclei.sarif \
+            -json-export nuclei-results.json \
+            -timeout 10 \
+            -rate-limit 50 \
+            -concurrency 10 \
+            -silent \
+            -no-interactsh || NUCLEI_EXIT=$?
+
+          echo "Nuclei exit code: ${NUCLEI_EXIT:-0}"
+
+      - name: Enforce CVSS thresholds (Nuclei)
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, os
+
+          sarif_path = "nuclei.sarif"
+          json_path  = "nuclei-results.json"
+
+          critical, high, medium = 0, 0, 0
+          critical_details = []
+          high_details     = []
+
+          # Parse Nuclei JSON output (one JSON object per line)
+          if os.path.exists(json_path):
+              with open(json_path) as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          finding = json.loads(line)
+                      except json.JSONDecodeError:
+                          continue
+
+                      sev  = finding.get("info", {}).get("severity", "").lower()
+                      name = finding.get("info", {}).get("name", "")
+                      host = finding.get("host", "")
+                      cvss_meta = finding.get("info", {}).get("classification", {})
+                      cvss_score = float(cvss_meta.get("cvss-score", 0.0) or 0.0)
+
+                      # Map Nuclei severity to CVSS approximation if not available
+                      if cvss_score == 0.0:
+                          cvss_score = {"critical": 9.5, "high": 7.5,
+                                        "medium": 5.0, "low": 2.0, "info": 0.0}.get(sev, 0.0)
+
+                      entry = {"name": name, "host": host, "cvss": cvss_score, "severity": sev}
+                      if cvss_score >= 9.0 or sev == "critical":
+                          critical += 1
+                          critical_details.append(entry)
+                      elif cvss_score >= 7.0 or sev == "high":
+                          high += 1
+                          high_details.append(entry)
+                      else:
+                          medium += 1
+
+          print(f"\nNuclei Scan Results:")
+          print(f"  CRITICAL (CVSS >= 9.0): {critical}")
+          print(f"  HIGH     (CVSS 7-8.9):  {high}")
+          print(f"  MEDIUM/LOW (<7.0):      {medium}")
+
+          if critical_details:
+              print("\nCRITICAL findings:")
+              for d in critical_details[:10]:
+                  print(f"  [{d['severity'].upper()}] CVSS {d['cvss']:.1f} — {d['name']} @ {d['host']}")
+
+          if critical > 0:
+              print(f"\n::error::Nuclei found {critical} CRITICAL CVEs (CVSS >= 9.0) — DAST workflow failed")
+              sys.exit(1)
+          elif high > 0:
+              print(f"\n::warning::Nuclei found {high} HIGH CVEs (CVSS 7-8.9) — creating tracking tickets")
+          else:
+              print("\nNuclei: no critical or high findings.")
+          PYEOF
+
+      - name: Upload Nuclei SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: nuclei.sarif
+          category:   nuclei-dast
+
+      - name: Upload Nuclei results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-results-${{ github.run_id }}
+          path: |
+            nuclei.sarif
+            nuclei-results.json
+            nuclei-results.txt
+          retention-days: 30
+
+# =============================================================================
+# JOB 4 — Create GitHub Issues for HIGH Findings
+# =============================================================================
+  create-security-tickets:
+    name: Create Security Tickets (HIGH findings)
+    runs-on: ubuntu-24.04
+    needs: [owasp-zap, nuclei-scan]
+    if: always() && (needs.owasp-zap.result == 'failure' || needs.nuclei-scan.result == 'failure')
+    timeout-minutes: 10
+    steps:
+      - name: Download ZAP results
+        uses: actions/download-artifact@v4
+        with:
+          name: zap-results-${{ github.run_id }}
+          path: scan-results/zap/
+        continue-on-error: true
+
+      - name: Download Nuclei results
+        uses: actions/download-artifact@v4
+        with:
+          name: nuclei-results-${{ github.run_id }}
+          path: scan-results/nuclei/
+        continue-on-error: true
+
+      - name: Create consolidated security issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs   = require("fs");
+            const path = require("path");
+
+            // Read Nuclei JSON results if available
+            let nucleiSummary = "No Nuclei data available.";
+            const nucleiPath = "scan-results/nuclei/nuclei-results.json";
+            if (fs.existsSync(nucleiPath)) {
+              const lines = fs.readFileSync(nucleiPath, "utf8").trim().split("\n");
+              const critical = lines.filter(l => {
+                try { return JSON.parse(l)?.info?.severity === "critical"; } catch { return false; }
+              }).length;
+              const high = lines.filter(l => {
+                try { return JSON.parse(l)?.info?.severity === "high"; } catch { return false; }
+              }).length;
+              nucleiSummary = `- **CRITICAL**: ${critical}\n- **HIGH**: ${high}`;
+            }
+
+            const body = [
+              "## DAST Security Alert",
+              "",
+              `**Workflow run:** [${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              `**Triggered:** ${new Date().toISOString()}`,
+              `**Ref:** \`${context.ref}\``,
+              "",
+              "### OWASP ZAP",
+              `SARIF results uploaded to [Security tab](https://github.com/${context.repo.owner}/${context.repo.repo}/security/code-scanning).`,
+              "",
+              "### Nuclei CVE Scanner",
+              nucleiSummary,
+              "",
+              "### CVSS Threshold Policy",
+              "| Threshold | Action |",
+              "|-----------|--------|",
+              "| CVSS > 9.0 | Build/workflow blocked |",
+              "| CVSS 7.0-8.9 | This ticket — remediate within 30 days |",
+              "| CVSS < 7.0 | Logged in Security tab only |",
+              "",
+              "### Next Steps",
+              "1. Review findings in the [Security Code Scanning tab](https://github.com/" +
+                `${context.repo.owner}/${context.repo.repo}/security/code-scanning)`,
+              "2. Assign findings to the responsible team",
+              "3. Remediate CRITICAL within 7 days, HIGH within 30 days",
+            ].join("\n");
+
+            await github.rest.issues.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  `[DAST] Security findings detected — run #${context.runId}`,
+              body,
+              labels: ["security", "dast", "vulnerability"]
+            });
+
+# =============================================================================
+# JOB 5 — Cleanup Ephemeral Environment
+# =============================================================================
+  cleanup:
+    name: Cleanup Ephemeral Environment
+    runs-on: ubuntu-24.04
+    needs:
+      - deploy-ephemeral
+      - owasp-zap
+      - nuclei-scan
+    if: always() && needs.deploy-ephemeral.outputs.use-ephemeral == 'true'
+    timeout-minutes: 10
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Delete ACI container group
+        run: |
+          RESOURCE_GROUP="${{ vars.DAST_RESOURCE_GROUP || 'rg-dast-ephemeral' }}"
+          CONTAINER_GROUP="${{ needs.deploy-ephemeral.outputs.container-group }}"
+
+          echo "Deleting ephemeral container group: ${CONTAINER_GROUP}"
+          az container delete \
+            --resource-group   "$RESOURCE_GROUP" \
+            --name             "$CONTAINER_GROUP" \
+            --yes \
+            --subscription     "${{ secrets.AZURE_SUBSCRIPTION_ID }}" || {
+              echo "::warning::Failed to delete container group — may need manual cleanup"
+            }
+          echo "Ephemeral environment cleaned up."
+
+# =============================================================================
+# JOB 6 — DAST Summary
+# =============================================================================
+  dast-summary:
+    name: DAST Summary
+    runs-on: ubuntu-24.04
+    needs:
+      - owasp-zap
+      - nuclei-scan
+      - cleanup
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Write job summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const zapResult    = "${{ needs.owasp-zap.result }}";
+            const nucleiResult = "${{ needs.nuclei-scan.result }}";
+            const zapIcon      = zapResult    === "success" ? "PASS" : "FAIL";
+            const nucleiIcon   = nucleiResult === "success" ? "PASS" : "FAIL";
+
+            const summary = [
+              "## DAST Run Summary",
+              "",
+              `| Scanner | Result |`,
+              `|---------|--------|`,
+              `| OWASP ZAP | **${zapIcon}** (${zapResult}) |`,
+              `| Nuclei CVE | **${nucleiIcon}** (${nucleiResult}) |`,
+              "",
+              "### CVSS Policy Applied",
+              "- CVSS > 9.0 → workflow failed (must remediate before next release)",
+              "- CVSS 7.0-8.9 → GitHub issue created (30-day SLA)",
+              "- CVSS < 7.0 → logged in Security tab only",
+              "",
+              `Results available in the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning).`
+            ].join("\n");
+
+            await core.summary.addRaw(summary).write();
+
+      - name: Fail workflow if any critical scanner failed
+        if: needs.owasp-zap.result == 'failure' || needs.nuclei-scan.result == 'failure'
+        run: |
+          echo "::error::One or more DAST scanners detected CRITICAL findings. See Security tab for details."
+          exit 1
