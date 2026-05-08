@@ -1,0 +1,135 @@
+# =============================================================================
+# Kyverno ClusterPolicy — Restrict Container Registries
+#
+# Only images from the following approved registries are permitted:
+#   - myacr.azurecr.io        (organisation's private ACR)
+#   - mcr.microsoft.com       (Microsoft Container Registry — base images)
+#
+# All other registries (including Docker Hub, quay.io, ghcr.io, etc.) are
+# blocked at admission time.  This prevents supply-chain attacks via
+# untrusted third-party images.
+#
+# Action: Enforce (cluster-wide, excluding privileged system namespaces).
+# =============================================================================
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+  annotations:
+    policies.kyverno.io/title: Restrict Image Registries
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/minversion: "1.6.0"
+    policies.kyverno.io/description: >-
+      Only images sourced from myacr.azurecr.io or mcr.microsoft.com are
+      permitted. This blocks accidental or malicious use of public registries
+      and enforces a controlled software supply chain.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+
+    # -------------------------------------------------------------------------
+    # Rule 1 — Validate init containers
+    # -------------------------------------------------------------------------
+    - name: validate-registries-init-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Image '{{ element.image }}' is from an unapproved registry.
+          Only 'myacr.azurecr.io' and 'mcr.microsoft.com' are permitted.
+        foreach:
+          - list: "request.object.spec.initContainers"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "myacr.azurecr.io"
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "mcr.microsoft.com"
+
+    # -------------------------------------------------------------------------
+    # Rule 2 — Validate regular containers
+    # -------------------------------------------------------------------------
+    - name: validate-registries-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Image '{{ element.image }}' is from an unapproved registry.
+          Only 'myacr.azurecr.io' and 'mcr.microsoft.com' are permitted.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "myacr.azurecr.io"
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "mcr.microsoft.com"
+
+    # -------------------------------------------------------------------------
+    # Rule 3 — Validate ephemeral containers (kubectl debug)
+    # -------------------------------------------------------------------------
+    - name: validate-registries-ephemeral-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - istio-system
+                - cert-manager
+                - kube-public
+                - kube-node-lease
+      validate:
+        message: >-
+          Ephemeral container image '{{ element.image }}' is from an
+          unapproved registry. Only 'myacr.azurecr.io' and
+          'mcr.microsoft.com' are permitted.
+        foreach:
+          - list: "request.object.spec.ephemeralContainers"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "myacr.azurecr.io"
+                  - key: "{{ element.image }}"
+                    operator: NotContains
+                    value: "mcr.microsoft.com"
