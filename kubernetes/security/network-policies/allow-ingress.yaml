@@ -1,0 +1,382 @@
+# =============================================================================
+# NetworkPolicy — Allow Rules (Production and Staging)
+#
+# These policies carve out explicit allow paths on top of the default-deny-all
+# baseline defined in default-deny-all.yaml.
+#
+# Paths permitted:
+#   1. Ingress from Istio ingress gateway → app pods on port 8080
+#   2. Ingress from monitoring namespace (Prometheus scrape) → app pods
+#   3. Egress to kube-dns (UDP/TCP 53) — DNS resolution for all pods
+#   4. Egress to monitoring namespace — push metrics, traces, logs
+#   5. Egress HTTPS to Azure services (ACR, Key Vault, Service Bus)
+#   6. Istio sidecar control-plane ports (15000-15010, 15014, 15021)
+#
+# Staging mirrors production policies (separate objects per namespace).
+# =============================================================================
+
+# =============================================================================
+# PRODUCTION NAMESPACE
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Allow ingress from Istio ingress gateway to app pods on port 8080
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-istio-ingress
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    security-tier: restricted
+    policy-type: allow-ingress
+  annotations:
+    description: >-
+      Permits the Istio ingressgateway pod (in istio-system namespace) to
+      reach application pods on port 8080. All other ingress remains blocked.
+spec:
+  podSelector:
+    matchLabels:
+      app: devsecops-app
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Source must be in the istio-system namespace AND be the ingress gateway
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              app: istio-ingressgateway
+      ports:
+        - protocol: TCP
+          port: 8080
+
+# -----------------------------------------------------------------------------
+# 2. Allow Prometheus scraping from monitoring namespace → app pods
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-ingress
+  annotations:
+    description: >-
+      Permits Prometheus (in the monitoring namespace) to scrape metrics from
+      app pods on port 8080 (via /metrics endpoint).
+spec:
+  podSelector:
+    matchLabels:
+      app: devsecops-app
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
+
+# -----------------------------------------------------------------------------
+# 3. Allow egress to kube-dns (port 53) — required for all pods
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-egress
+  annotations:
+    description: >-
+      Permits all pods in production to reach kube-dns on port 53 (UDP and TCP).
+      Without this rule, DNS resolution is broken and all network calls fail.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+# -----------------------------------------------------------------------------
+# 4. Allow egress to monitoring namespace — metrics, traces, logs
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-monitoring
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-egress
+  annotations:
+    description: >-
+      Permits app pods to push telemetry to the monitoring namespace:
+        - Loki (3100)           — structured log shipping
+        - OTel gRPC (4317)      — OpenTelemetry traces/metrics
+        - OTel HTTP (4318)      — OpenTelemetry HTTP protocol
+        - Prometheus (9090)     — remote write (if configured)
+        - Alertmanager (9093)   — alert forwarding
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 3100    # Grafana Loki
+        - protocol: TCP
+          port: 4317    # OpenTelemetry gRPC collector
+        - protocol: TCP
+          port: 4318    # OpenTelemetry HTTP collector
+        - protocol: TCP
+          port: 9090    # Prometheus remote-write
+        - protocol: TCP
+          port: 9093    # Alertmanager
+
+# -----------------------------------------------------------------------------
+# 5. Allow egress HTTPS to Azure services (ACR, Key Vault, Storage, etc.)
+#    Applied only to pods labelled azure-egress: "true"
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-azure-services
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-egress
+  annotations:
+    description: >-
+      Allows pods labelled 'azure-egress: "true"' to reach Azure platform
+      endpoints (ACR pull, Key Vault secret reads, Storage, Service Bus) over
+      HTTPS (443). Use this label sparingly — only on pods that genuinely
+      need Azure SDK/REST API access.
+spec:
+  podSelector:
+    matchLabels:
+      azure-egress: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+
+# -----------------------------------------------------------------------------
+# 6. Allow Istio sidecar control-plane communication
+#    Envoy proxies need to reach istiod for xDS config and telemetry.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-istio-control-plane
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-egress
+  annotations:
+    description: >-
+      Permits Envoy sidecar proxies to communicate with the Istio control
+      plane (istiod) for xDS discovery, certificate rotation, and telemetry
+      reporting. Required when Istio injection is enabled.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+      ports:
+        - protocol: TCP
+          port: 15010    # xDS (plaintext, internal use)
+        - protocol: TCP
+          port: 15012    # xDS (TLS)
+        - protocol: TCP
+          port: 15014    # control-plane metrics
+        - protocol: TCP
+          port: 15017    # webhook
+        - protocol: TCP
+          port: 8080     # istiod health check
+        - protocol: TCP
+          port: 443      # cert-manager ACME / webhook
+
+# =============================================================================
+# STAGING NAMESPACE
+# Mirror of the production policies — allows testing network policy behaviour
+# before promoting changes to production.
+# =============================================================================
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-istio-ingress
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: allow-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: devsecops-app
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              app: istio-ingressgateway
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: allow-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: devsecops-app
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: allow-egress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-monitoring
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: allow-egress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 3100
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 9093
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-istio-control-plane
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: allow-egress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+      ports:
+        - protocol: TCP
+          port: 15010
+        - protocol: TCP
+          port: 15012
+        - protocol: TCP
+          port: 15014
+        - protocol: TCP
+          port: 15017
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 443
