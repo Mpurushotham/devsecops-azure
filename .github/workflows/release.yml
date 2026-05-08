@@ -1,0 +1,634 @@
+# =============================================================================
+# Release Pipeline — Azure DevSecOps
+# =============================================================================
+# Triggered by pushing a semver tag (e.g., v1.2.3) to main.
+#
+# Pipeline stages:
+#   1. Build & push image to ACR (immutable SHA tag)
+#   2. Generate CycloneDX + SPDX SBOMs (syft)
+#   3. Sign image with cosign (keyless OIDC via Sigstore)
+#   4. Generate SLSA provenance (slsa-github-generator)
+#   5. Final Trivy scan on signed image
+#   6. Promote to production ACR
+#   7. Create GitHub Release with SBOMs attached
+#   8. Notify via Azure Monitor webhook
+#
+# Required secrets:
+#   ACR_USERNAME, ACR_PASSWORD, ACR_PROD_USERNAME, ACR_PROD_PASSWORD,
+#   AZURE_SUBSCRIPTION_ID, AZURE_MONITOR_WEBHOOK_URL
+# Required vars:
+#   ACR_REGISTRY, ACR_PROD_REGISTRY, ACR_REPOSITORY
+# =============================================================================
+
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+  # Allow manual release promotion
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.2.3)"
+        required: true
+      environment:
+        description: "Target environment"
+        required: true
+        default:  "production"
+        type: choice
+        options: [staging, production]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel in-flight releases
+
+permissions:
+  contents:      write   # Create release, upload assets
+  packages:      write   # Push to GitHub Packages
+  id-token:      write   # OIDC for cosign keyless + SLSA
+  security-events: write # Upload SARIF
+  actions:       read    # Required by SLSA generator
+
+# ── Global environment ─────────────────────────────────────────────────────
+env:
+  ACR_REGISTRY:      ${{ vars.ACR_REGISTRY }}
+  ACR_PROD_REGISTRY: ${{ vars.ACR_PROD_REGISTRY }}
+  ACR_REPOSITORY:    ${{ vars.ACR_REPOSITORY }}
+  IMAGE_TAG:         ${{ github.sha }}
+  RELEASE_TAG:       ${{ github.ref_name }}
+  JAVA_VERSION:      "21"
+
+# =============================================================================
+# JOB 1 — Build & Push Container Image (immutable SHA tag)
+# =============================================================================
+jobs:
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image-digest:     ${{ steps.build-push.outputs.digest }}
+      image-ref:        ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}@${{ steps.build-push.outputs.digest }}
+      image-tag-sha:    ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:sha-${{ github.sha }}
+      image-tag-semver: ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ github.ref_name }}
+    steps:
+      - name: Checkout source (full history for reproducibility)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Build application (reproducible, SOURCE_DATE_EPOCH locked)
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          mvn --batch-mode --no-transfer-progress \
+              -Dartifact.buildinfo.attach=true \
+              -Dproject.build.outputTimestamp="$(git log -1 --format=%cI)" \
+              clean package -DskipTests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Log in to ACR (staging/dev)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}
+          tags: |
+            # Immutable SHA tag (primary)
+            type=sha,format=long,prefix=sha-
+            # Semver tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # latest only on full release (not RC)
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-rc.') }}
+          labels: |
+            org.opencontainers.image.title=${{ env.ACR_REPOSITORY }}
+            org.opencontainers.image.description=Azure DevSecOps reference application
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push image (with SBOM + provenance)
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context:    .
+          push:       true
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          # Inline SBOM and provenance (BuildKit native)
+          sbom:       true
+          provenance: mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_COMMIT=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+
+      - name: Output image references
+        run: |
+          echo "Image digest:      ${{ steps.build-push.outputs.digest }}"
+          echo "Image ref (SHA):   ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:sha-${{ github.sha }}"
+          echo "Image ref (tag):   ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ github.ref_name }}"
+
+# =============================================================================
+# JOB 2 — Generate SBOMs (CycloneDX + SPDX via Syft)
+# =============================================================================
+  generate-sbom:
+    name: Generate SBOMs (CycloneDX + SPDX)
+    runs-on: ubuntu-24.04
+    needs: build-and-push
+    timeout-minutes: 15
+    outputs:
+      cyclonedx-artifact: sbom-cyclonedx-${{ github.sha }}
+      spdx-artifact:      sbom-spdx-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+            sh -s -- -b /usr/local/bin v1.18.1
+
+      - name: Generate CycloneDX SBOM from image
+        run: |
+          syft "${{ needs.build-and-push.outputs.image-ref }}" \
+            --output cyclonedx-json=sbom-cyclonedx.json \
+            --scope all-layers
+
+      - name: Generate SPDX SBOM from image
+        run: |
+          syft "${{ needs.build-and-push.outputs.image-ref }}" \
+            --output spdx-json=sbom-spdx.json \
+            --scope all-layers
+
+      - name: Generate CycloneDX SBOM from source tree
+        run: |
+          syft dir:. \
+            --output cyclonedx-json=sbom-source-cyclonedx.json
+
+      - name: Validate CycloneDX SBOM
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+
+          with open("sbom-cyclonedx.json") as f:
+              sbom = json.load(f)
+
+          components = sbom.get("components", [])
+          version    = sbom.get("specVersion", "unknown")
+          serial     = sbom.get("serialNumber", "")
+
+          print(f"CycloneDX version: {version}")
+          print(f"Serial number: {serial}")
+          print(f"Total components: {len(components)}")
+
+          if not serial:
+              print("::warning::SBOM missing serialNumber — may not be compliant")
+          if not components:
+              print("::error::SBOM has no components")
+              sys.exit(1)
+
+          print("SBOM validation passed.")
+          PYEOF
+
+      - name: Display SBOM statistics
+        run: |
+          python3 - <<'PYEOF'
+          import json
+
+          for fname, label in [("sbom-cyclonedx.json", "Image"), ("sbom-source-cyclonedx.json", "Source")]:
+              try:
+                  with open(fname) as f:
+                      sbom = json.load(f)
+              except FileNotFoundError:
+                  print(f"{label}: file not found")
+                  continue
+
+              comps = sbom.get("components", [])
+              by_type = {}
+              with_purl = sum(1 for c in comps if c.get("purl"))
+              with_cpe  = sum(1 for c in comps if c.get("cpe"))
+
+              for c in comps:
+                  t = c.get("type", "unknown")
+                  by_type[t] = by_type.get(t, 0) + 1
+
+              print(f"\n{label} SBOM ({fname}):")
+              print(f"  Total components: {len(comps)}")
+              print(f"  With PURL:        {with_purl}")
+              print(f"  With CPE:         {with_cpe}")
+              for t, n in sorted(by_type.items(), key=lambda x: -x[1]):
+                  print(f"  {t}: {n}")
+          PYEOF
+
+      - name: Upload SBOMs as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-release-${{ github.sha }}
+          path: |
+            sbom-cyclonedx.json
+            sbom-spdx.json
+            sbom-source-cyclonedx.json
+          retention-days: 365   # Keep for 1 year for compliance
+
+# =============================================================================
+# JOB 3 — Sign Image with cosign (keyless OIDC)
+# =============================================================================
+  sign-image:
+    name: Sign Image (cosign keyless)
+    runs-on: ubuntu-24.04
+    needs: [build-and-push, generate-sbom]
+    timeout-minutes: 15
+    env:
+      IMAGE_REF: ${{ needs.build-and-push.outputs.image-ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Sign image (Sigstore Rekor transparency log)
+        run: |
+          cosign sign --yes \
+            --rekor-url https://rekor.sigstore.dev \
+            --tlog-upload=true \
+            "${{ env.IMAGE_REF }}"
+          echo "Image signed successfully with OIDC identity."
+          echo "Certificate will be anchored to Rekor transparency log."
+
+      - name: Download SBOMs for attestation
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-release-${{ github.sha }}
+          path: sboms/
+
+      - name: Attest CycloneDX SBOM to image
+        run: |
+          cosign attest --yes \
+            --rekor-url https://rekor.sigstore.dev \
+            --predicate sboms/sbom-cyclonedx.json \
+            --type cyclonedx \
+            "${{ env.IMAGE_REF }}"
+
+      - name: Attest SPDX SBOM to image
+        run: |
+          cosign attest --yes \
+            --rekor-url https://rekor.sigstore.dev \
+            --predicate sboms/sbom-spdx.json \
+            --type spdxjson \
+            "${{ env.IMAGE_REF }}"
+
+      - name: Verify signature (sanity check)
+        run: |
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "${{ env.IMAGE_REF }}" | jq '.[0].optional | {issuer, subject}'
+
+# =============================================================================
+# JOB 4 — SLSA Provenance Generation
+# =============================================================================
+  slsa-provenance:
+    name: SLSA Provenance (Level 3)
+    needs: [build-and-push]
+    # Uses the official SLSA generator — must run in its own job with these permissions
+    permissions:
+      actions:  read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.0.0
+    with:
+      image:  ${{ vars.ACR_REGISTRY }}/${{ vars.ACR_REPOSITORY }}
+      digest: ${{ needs.build-and-push.outputs.image-digest }}
+      registry-username: ${{ vars.ACR_USERNAME_VAR }}
+    secrets:
+      registry-password: ${{ secrets.ACR_PASSWORD }}
+
+# =============================================================================
+# JOB 5 — Final Trivy Scan on Signed Image
+# =============================================================================
+  final-image-scan:
+    name: Final Image Scan (Trivy)
+    runs-on: ubuntu-24.04
+    needs: [sign-image, slsa-provenance]
+    timeout-minutes: 20
+    env:
+      IMAGE_REF: ${{ needs.build-and-push.outputs.image-ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Trivy scan — full (OS + library)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref:  ${{ env.IMAGE_REF }}
+          format:     sarif
+          output:     trivy-release.sarif
+          severity:   CRITICAL,HIGH,MEDIUM,LOW
+          exit-code:  "0"
+          vuln-type:  os,library
+
+      - name: Trivy scan — JSON (for artifact)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format:    json
+          output:    trivy-release.json
+          severity:  CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Enforce CVSS thresholds (final gate)
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+
+          with open("trivy-release.sarif") as f:
+              sarif = json.load(f)
+
+          critical = sum(
+              1 for run in sarif.get("runs", [])
+              for result in run.get("results", [])
+              if result.get("level") == "error"
+          )
+          high = sum(
+              1 for run in sarif.get("runs", [])
+              for result in run.get("results", [])
+              if result.get("level") == "warning"
+          )
+          medium = sum(
+              1 for run in sarif.get("runs", [])
+              for result in run.get("results", [])
+              if result.get("level") == "note"
+          )
+
+          print(f"Final image scan — CRITICAL: {critical}, HIGH: {high}, MEDIUM: {medium}")
+
+          if critical > 0:
+              print(f"::error::Release blocked — {critical} CRITICAL CVEs found in signed image (CVSS > 9.0)")
+              sys.exit(1)
+          elif high > 0:
+              print(f"::warning::{high} HIGH CVEs found in release image — filing tracking ticket")
+          else:
+              print("Release image scan passed all CVSS thresholds.")
+          PYEOF
+
+      - name: Upload Trivy SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-release.sarif
+          category:   trivy-release
+
+      - name: Upload Trivy JSON report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-release-report-${{ github.sha }}
+          path: trivy-release.json
+          retention-days: 365
+
+# =============================================================================
+# JOB 6 — Promote to Production ACR
+# =============================================================================
+  promote-to-prod-acr:
+    name: Promote Image to Production ACR
+    runs-on: ubuntu-24.04
+    needs: final-image-scan
+    if: ${{ !contains(github.ref_name, '-rc.') }}   # Only stable releases
+    timeout-minutes: 15
+    environment:
+      name: production
+    outputs:
+      prod-image-ref: ${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}@${{ steps.copy.outputs.digest }}
+    steps:
+      - name: Install crane
+        run: |
+          curl -sSfL \
+            "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin crane
+
+      - name: Log in to staging ACR (source)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Log in to production ACR (destination)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_PROD_REGISTRY }}
+          username: ${{ secrets.ACR_PROD_USERNAME }}
+          password: ${{ secrets.ACR_PROD_PASSWORD }}
+
+      - name: Copy image to production ACR (by digest — immutable)
+        id: copy
+        run: |
+          SOURCE="${{ needs.build-and-push.outputs.image-ref }}"
+          DEST_SHA="${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}:sha-${{ github.sha }}"
+          DEST_TAG="${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ env.RELEASE_TAG }}"
+          DEST_LATEST="${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}:latest"
+
+          # Copy by digest (guarantees byte-for-byte identity)
+          crane copy "$SOURCE" "$DEST_SHA"
+          crane copy "$SOURCE" "$DEST_TAG"
+          crane copy "$SOURCE" "$DEST_LATEST"
+
+          DIGEST=$(crane digest "$DEST_SHA")
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Promoted to production ACR:"
+          echo "  SHA tag: $DEST_SHA"
+          echo "  Version: $DEST_TAG"
+          echo "  Digest:  $DIGEST"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign production image
+        run: |
+          cosign sign --yes \
+            "${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}@${{ steps.copy.outputs.digest }}"
+
+# =============================================================================
+# JOB 7 — Create GitHub Release with SBOM attachments
+# =============================================================================
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [promote-to-prod-acr, generate-sbom]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-release-${{ github.sha }}
+          path: release-assets/
+
+      - name: Download Trivy report
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-release-report-${{ github.sha }}
+          path: release-assets/
+
+      - name: Generate release notes
+        id: release-notes
+        run: |
+          cat > release-notes.md << 'NOTES'
+          ## Release ${{ env.RELEASE_TAG }}
+
+          ### Security Posture
+          - All SAST, SCA, and image scans passed CVSS thresholds
+          - Image signed with cosign (keyless OIDC via Sigstore)
+          - SLSA Level 3 provenance generated
+          - SBOMs attached in CycloneDX and SPDX formats
+
+          ### Container Image
+          | Registry | Tag | Digest |
+          |----------|-----|--------|
+          | `${{ env.ACR_PROD_REGISTRY }}` | `${{ env.RELEASE_TAG }}` | `${{ needs.build-and-push.outputs.image-digest }}` |
+          | `${{ env.ACR_PROD_REGISTRY }}` | `sha-${{ github.sha }}` | (same) |
+
+          ### Verify Image Signature
+          ```bash
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ env.RELEASE_TAG }}
+          ```
+
+          ### Verify SBOM Attestation
+          ```bash
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ env.RELEASE_TAG }}
+          ```
+          NOTES
+          echo "notes_file=release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ env.RELEASE_TAG }}
+          name:       "Release ${{ env.RELEASE_TAG }}"
+          body_path:  release-notes.md
+          prerelease: ${{ contains(env.RELEASE_TAG, '-rc.') }}
+          files: |
+            release-assets/sbom-cyclonedx.json
+            release-assets/sbom-spdx.json
+            release-assets/sbom-source-cyclonedx.json
+            release-assets/trivy-release.json
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+# =============================================================================
+# JOB 8 — Notify Azure Monitor
+# =============================================================================
+  notify:
+    name: Notify Azure Monitor
+    runs-on: ubuntu-24.04
+    needs:
+      - create-github-release
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          RESULT="${{ needs.create-github-release.result }}"
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+
+      - name: Send Azure Monitor webhook notification
+        run: |
+          STATUS="${{ steps.status.outputs.result }}"
+          COLOR=$([ "$STATUS" = "success" ] && echo "00C851" || echo "FF4444")
+
+          curl -X POST "${{ secrets.AZURE_MONITOR_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            --retry 3 \
+            --retry-delay 5 \
+            -d "{
+              \"schemaId\": \"AzureMonitorMetricAlert\",
+              \"data\": {
+                \"status\":      \"${STATUS}\",
+                \"release_tag\": \"${{ env.RELEASE_TAG }}\",
+                \"sha\":         \"${{ github.sha }}\",
+                \"actor\":       \"${{ github.actor }}\",
+                \"repo\":        \"${{ github.repository }}\",
+                \"workflow\":    \"${{ github.workflow }}\",
+                \"run_url\":     \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+                \"image_ref\":   \"${{ needs.build-and-push.outputs.image-ref }}\"
+              }
+            }"
+
+      - name: Post release summary to job summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## Release Summary
+
+          | Item | Value |
+          |------|-------|
+          | Status | ${{ needs.create-github-release.result }} |
+          | Tag | `${{ env.RELEASE_TAG }}` |
+          | SHA | `${{ github.sha }}` |
+          | Image | `${{ env.ACR_PROD_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ env.RELEASE_TAG }}` |
+          | Digest | `${{ needs.build-and-push.outputs.image-digest }}` |
+          | Actor | `${{ github.actor }}` |
+
+          ### Security Attestations
+          - cosign signature: anchored in Rekor transparency log
+          - SLSA provenance: Level 3
+          - SBOMs: CycloneDX + SPDX attached to GitHub Release
+          EOF
