@@ -1,0 +1,268 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: tracing
+  labels:
+    app.kubernetes.io/name: tempo
+    app.kubernetes.io/component: trace-store
+    app.kubernetes.io/part-of: observability-stack
+data:
+  tempo.yaml: |
+    # ------------------------------------------------------------------
+    # Stream-over-HTTP (multi-tenant)
+    # ------------------------------------------------------------------
+    stream_over_http_enabled: true
+    multitenancy_enabled: false
+
+    # ------------------------------------------------------------------
+    # Server
+    # ------------------------------------------------------------------
+    server:
+      http_listen_port: 3200
+      grpc_listen_port: 9096
+      log_level: info
+      grpc_server_max_recv_msg_size: 4194304   # 4 MiB
+      grpc_server_max_send_msg_size: 4194304   # 4 MiB
+      http_server_read_timeout: 30s
+      http_server_write_timeout: 30s
+
+    # ------------------------------------------------------------------
+    # Distributor — receives spans and routes to ingesters
+    # ------------------------------------------------------------------
+    distributor:
+      receivers:
+        # OTLP gRPC
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+              max_recv_msg_size_mib: 4
+            http:
+              endpoint: 0.0.0.0:4318
+              cors:
+                allowed_origins:
+                  - "https://*.company.com"
+                  - "http://localhost:*"
+
+        # Jaeger (legacy support)
+        jaeger:
+          protocols:
+            thrift_http:
+              endpoint: 0.0.0.0:14268
+            thrift_binary:
+              endpoint: 0.0.0.0:6832
+            thrift_compact:
+              endpoint: 0.0.0.0:6831
+            grpc:
+              endpoint: 0.0.0.0:14250
+
+        # Zipkin (legacy support)
+        zipkin:
+          endpoint: 0.0.0.0:9411
+
+      log_received_spans:
+        enabled: false
+        include_all_attributes: false
+
+      ring:
+        kvstore:
+          store: memberlist
+
+    # ------------------------------------------------------------------
+    # Ingester
+    # ------------------------------------------------------------------
+    ingester:
+      lifecycler:
+        ring:
+          kvstore:
+            store: memberlist
+          replication_factor: 3
+        num_tokens: 512
+      max_block_bytes: 104857600      # 100 MiB
+      max_block_duration: 30m
+      trace_idle_period: 10s
+      flush_check_period: 10s
+      complete_block_timeout: 15m
+
+    # ------------------------------------------------------------------
+    # Compactor
+    # ------------------------------------------------------------------
+    compactor:
+      ring:
+        kvstore:
+          store: memberlist
+      compaction:
+        compaction_window: 1h
+        max_compaction_objects: 1000000
+        block_retention: 168h    # 7 days
+        compacted_block_retention: 1h
+        v2_in_buffer_bytes: 5242880     # 5 MiB
+        v2_out_buffer_bytes: 20971520   # 20 MiB
+        v2_prefetch_traces_count: 1000
+
+    # ------------------------------------------------------------------
+    # Storage: Azure Blob Storage
+    # ------------------------------------------------------------------
+    storage:
+      trace:
+        backend: azure
+        azure:
+          storage_account_name: ${AZURE_STORAGE_ACCOUNT_NAME}
+          storage_account_key: ${AZURE_STORAGE_ACCOUNT_KEY}
+          container_name: tempo-traces
+          endpoint_suffix: blob.core.windows.net
+          hedge_requests_at: 400ms
+          hedge_requests_up_to: 2
+        pool:
+          max_workers: 100
+          queue_depth: 10000
+        wal:
+          path: /var/tempo/wal
+          v2_encoding: snappy
+          search_encoding: none
+        block:
+          bloom_filter_false_positive: 0.01
+          bloom_filter_shard_size_bytes: 100000
+          v2_index_downsample_bytes: 1000000
+          v2_encoding: zstd
+          search_encoding: snappy
+          replication_factor: 3
+
+    # ------------------------------------------------------------------
+    # Memberlist
+    # ------------------------------------------------------------------
+    memberlist:
+      join_members:
+        - tempo-memberlist.tracing.svc.cluster.local:7946
+      bind_port: 7946
+      abort_if_cluster_join_fails: false
+
+    # ------------------------------------------------------------------
+    # Query-frontend
+    # ------------------------------------------------------------------
+    query_frontend:
+      max_retries: 2
+      search:
+        duration_slo: 5s
+        throughput_bytes_slo: 1073741824   # 1 GiB
+      trace_by_id:
+        duration_slo: 5s
+
+    # ------------------------------------------------------------------
+    # Querier
+    # ------------------------------------------------------------------
+    querier:
+      frontend_worker:
+        frontend_address: tempo-query-frontend.tracing.svc.cluster.local:9096
+      max_concurrent_queries: 20
+      search:
+        query_timeout: 30s
+        prefer_self: 10
+        external_endpoints: []
+        external_hedge_requests_at: 8s
+        external_hedge_requests_up_to: 2
+
+    # ------------------------------------------------------------------
+    # Metrics generator — derives RED metrics from traces
+    # ------------------------------------------------------------------
+    metrics_generator:
+      registry:
+        external_labels:
+          source: tempo
+          cluster: aks-prod
+      storage:
+        path: /var/tempo/generator/wal
+        remote_write:
+          - url: http://prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+            send_exemplars: true
+      processor:
+        service_graphs:
+          histogram_buckets:
+            - 0.1
+            - 0.2
+            - 0.4
+            - 0.8
+            - 1.6
+            - 3.2
+            - 6.4
+            - 12.8
+          dimensions:
+            - namespace
+            - http.method
+            - http.status_code
+          peer_attributes:
+            - db.name
+            - db.system
+            - net.sock.peer.addr
+          max_items: 10000
+          wait: 10s
+          workers: 10
+        span_metrics:
+          histogram_buckets:
+            - 0.002
+            - 0.004
+            - 0.008
+            - 0.016
+            - 0.032
+            - 0.064
+            - 0.128
+            - 0.256
+            - 0.512
+            - 1.024
+            - 2.048
+            - 4.096
+            - 8.192
+          dimensions:
+            - service.name
+            - span.name
+            - span.kind
+            - status.code
+            - http.method
+            - http.status_code
+            - namespace
+          enable_target_info: true
+          target_info_excluded_dimensions:
+            - telemetry.sdk.language
+            - telemetry.sdk.name
+            - telemetry.sdk.version
+
+    # ------------------------------------------------------------------
+    # Search (TraceQL)
+    # ------------------------------------------------------------------
+    search_enabled: true
+    search:
+      external_endpoints: []
+      chunk_size_bytes: 1048576     # 1 MiB
+      read_all_blocks: false
+      prefetch_trace_count: 1000
+      pipeline_workers: 2
+
+    # ------------------------------------------------------------------
+    # Limits / per-tenant overrides
+    # ------------------------------------------------------------------
+    overrides:
+      defaults:
+        # Trace ingestion
+        ingestion_rate_limit_bytes: 15000000   # 15 MB/s
+        ingestion_burst_size_bytes: 20000000   # 20 MB
+        max_traces_per_user: 100000
+        max_global_traces_per_user: 0
+        max_bytes_per_trace: 5000000           # 5 MB
+        max_search_bytes_per_trace: 0
+
+        # Retention: 7 days
+        block_retention: 168h
+
+        # Metrics generator
+        metrics_generator_processors:
+          - service-graphs
+          - span-metrics
+        metrics_generator_max_active_series: 0
+
+    # ------------------------------------------------------------------
+    # Usage report (opt-out)
+    # ------------------------------------------------------------------
+    usage_report:
+      reporting_enabled: false
