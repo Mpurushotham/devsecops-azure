@@ -1,0 +1,5 @@
+# Trivy ignore file — CVEs with accepted risk (document reason + expiry)
+# Format: CVE-ID [expiry-date] [comment]
+
+# Example ignored CVEs (replace with actual accepted risks):
+# CVE-2023-XXXXX exp:2024-12-31 # Not exploitable: no attack vector in our deployment
