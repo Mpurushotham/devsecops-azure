@@ -1,0 +1,81 @@
+# ArgoCD Application definition for blue/green production deployment.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: devsecops-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/name: devsecops-app
+    environment: production
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/org/devsecops-app
+    targetRevision: HEAD
+    path: devsecops/kubernetes/base
+    helm:
+      valueFiles:
+        - values-production.yaml
+      parameters:
+        - name: image.registry
+          value: myacr.azurecr.io
+        - name: image.repository
+          value: devsecops-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=false
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  revisionHistoryLimit: 10
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+---
+# ArgoCD AppProject with RBAC constraints
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: devsecops
+  namespace: argocd
+spec:
+  description: DevSecOps production workloads
+  sourceRepos:
+    - "https://github.com/org/devsecops-app"
+    - "https://charts.bitnami.com/bitnami"
+  destinations:
+    - namespace: production
+      server: https://kubernetes.default.svc
+    - namespace: staging
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+  roles:
+    - name: ci-deployer
+      description: CI pipeline can sync applications
+      policies:
+        - p, proj:devsecops:ci-deployer, applications, sync, devsecops/*, allow
+        - p, proj:devsecops:ci-deployer, applications, get, devsecops/*, allow
+      jwtTokens: []
