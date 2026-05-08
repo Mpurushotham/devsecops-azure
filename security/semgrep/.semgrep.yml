@@ -1,0 +1,190 @@
+# Semgrep configuration for SAST scanning.
+# Run: semgrep --config=devsecops/security/semgrep/.semgrep.yml .
+rules:
+  # ── Hardcoded secrets ──────────────────────────────────────────────────────
+  - id: hardcoded-password
+    patterns:
+      - pattern: |
+          $VAR = "..."
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i)(password|passwd|secret|token|api_key|apikey|private_key)
+      - metavariable-regex:
+          metavariable: "\"...\""
+          regex: .{8,}
+    message: "Potential hardcoded credential in variable $VAR"
+    languages: [python, javascript, typescript, go, java]
+    severity: ERROR
+    metadata:
+      cwe: CWE-798
+      owasp: A2:2021
+
+  # ── SQL injection ──────────────────────────────────────────────────────────
+  - id: sql-injection-format-string
+    pattern: |
+      cursor.execute("..." % ...)
+    message: "Possible SQL injection via string formatting"
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-89
+      owasp: A3:2021
+
+  - id: sql-injection-fstring
+    pattern: |
+      cursor.execute(f"...")
+    message: "Possible SQL injection via f-string"
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-89
+
+  # ── Command injection ──────────────────────────────────────────────────────
+  - id: os-system-injection
+    patterns:
+      - pattern: os.system(...)
+      - pattern-not: os.system("...")
+    message: "os.system() with variable input — possible command injection"
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-78
+      owasp: A3:2021
+
+  - id: subprocess-shell-true
+    pattern: |
+      subprocess.$FUNC(..., shell=True, ...)
+    message: "subprocess with shell=True — use list args instead"
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-78
+
+  # ── Insecure deserialization ───────────────────────────────────────────────
+  - id: pickle-deserialization
+    patterns:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+    message: "Pickle deserialization from untrusted data — use JSON or safe alternatives"
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-502
+      owasp: A8:2021
+
+  # ── SSRF ──────────────────────────────────────────────────────────────────
+  - id: ssrf-requests
+    patterns:
+      - pattern: requests.get($URL, ...)
+      - pattern-not: requests.get("...", ...)
+      - pattern-not-inside: |
+          if ...:
+            ...
+    message: "Potential SSRF — validate $URL against an allowlist"
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-918
+      owasp: A10:2021
+
+  # ── XML external entity ───────────────────────────────────────────────────
+  - id: xxe-lxml
+    patterns:
+      - pattern: lxml.etree.parse(...)
+      - pattern-not-inside: |
+          $PARSER = lxml.etree.XMLParser(resolve_entities=False, ...)
+          ...
+    message: "lxml XML parsing without disabling external entities — potential XXE"
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-611
+      owasp: A5:2021
+
+  # ── Insecure crypto ───────────────────────────────────────────────────────
+  - id: insecure-hash-md5
+    pattern: hashlib.md5(...)
+    message: "MD5 is cryptographically broken — use SHA-256 or better"
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-327
+
+  - id: insecure-hash-sha1
+    pattern: hashlib.sha1(...)
+    message: "SHA-1 is deprecated for security — use SHA-256 or better"
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-327
+
+  # ── Flask/Django security ─────────────────────────────────────────────────
+  - id: flask-debug-true
+    pattern: app.run(..., debug=True, ...)
+    message: "Flask debug mode enabled — never deploy with debug=True"
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-489
+
+  - id: flask-secret-key-hardcoded
+    patterns:
+      - pattern: app.secret_key = "..."
+      - pattern-not: app.secret_key = os.environ[...]
+    message: "Flask secret key is hardcoded — use environment variable"
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-798
+
+  # ── Kubernetes misconfigurations ──────────────────────────────────────────
+  - id: k8s-privileged-container
+    patterns:
+      - pattern: |
+          securityContext:
+            privileged: true
+    message: "Privileged container detected in Kubernetes manifest"
+    languages: [yaml]
+    severity: ERROR
+    metadata:
+      cwe: CWE-250
+
+  - id: k8s-run-as-root
+    patterns:
+      - pattern: |
+          securityContext:
+            runAsUser: 0
+    message: "Container configured to run as root (uid=0)"
+    languages: [yaml]
+    severity: ERROR
+    metadata:
+      cwe: CWE-250
+
+  # ── Terraform misconfigurations ───────────────────────────────────────────
+  - id: tf-public-storage-account
+    patterns:
+      - pattern: |
+          resource "azurerm_storage_account" $NAME {
+            ...
+            allow_blob_public_access = true
+            ...
+          }
+    message: "Azure Storage Account has public blob access enabled"
+    languages: [hcl]
+    severity: ERROR
+    metadata:
+      cwe: CWE-284
+
+  - id: tf-aks-rbac-disabled
+    patterns:
+      - pattern: |
+          resource "azurerm_kubernetes_cluster" $NAME {
+            ...
+            role_based_access_control_enabled = false
+            ...
+          }
+    message: "AKS cluster has RBAC disabled"
+    languages: [hcl]
+    severity: ERROR
+    metadata:
+      cwe: CWE-284
