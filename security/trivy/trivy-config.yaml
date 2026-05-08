@@ -1,0 +1,47 @@
+# Trivy configuration for container image, filesystem, and IaC scanning.
+# Usage: trivy --config devsecops/security/trivy/trivy-config.yaml image myimage:tag
+scan:
+  security-checks:
+    - vuln
+    - config
+    - secret
+    - license
+
+vulnerability:
+  type:
+    - os
+    - library
+  ignore-unfixed: false
+
+severity:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+  - LOW
+
+exit-code: 1
+
+format: table
+
+ignore-policy: devsecops/security/trivy/trivy-ignore-policy.rego
+
+# Ignore specific CVEs that are false positives or have accepted risk
+ignorefile: devsecops/security/trivy/.trivyignore
+
+db:
+  no-progress: false
+
+cache:
+  dir: /tmp/trivy-cache
+
+timeout: 10m
+
+secret:
+  config: devsecops/security/trivy/trivy-secret.yaml
+
+misconfiguration:
+  include-non-failures: false
+  helm:
+    values: []
+  terraform:
+    vars: []
