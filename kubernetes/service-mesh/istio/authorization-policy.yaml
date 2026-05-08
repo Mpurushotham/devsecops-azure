@@ -1,0 +1,300 @@
+# =============================================================================
+# Istio AuthorizationPolicy — Fine-Grained Access Control
+#
+# Implements the principle of least privilege at the service mesh layer.
+# Works alongside NetworkPolicy (L3/L4) to provide L7 access control.
+#
+# Policy design:
+#   - Default DENY ALL in production (explicit deny-all policy with no rules)
+#   - Explicit ALLOW rules for each required communication path
+#   - SPIFFE principal-based authorization (workload identity, not IP)
+#   - Health check endpoints permitted for kubelet probes (no source principal)
+#   - Prometheus scrape access from monitoring namespace
+#   - Staging is more permissive — allows intra-namespace traffic
+#
+# SPIFFE principal format:
+#   cluster.local/ns/<namespace>/sa/<service-account-name>
+# =============================================================================
+
+# =============================================================================
+# PRODUCTION NAMESPACE
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Deny all traffic in production by default
+#    An AuthorizationPolicy with no rules and no action defaults to DENY ALL.
+#    All traffic must be explicitly allowed by a subsequent policy.
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    security-tier: restricted
+    policy-type: deny-all
+  annotations:
+    description: >-
+      Default-deny AuthorizationPolicy for the production namespace.
+      No traffic is allowed until explicitly permitted by allow policies below.
+      Applied at the sidecar proxy level — enforced regardless of NetworkPolicy.
+spec:
+  # Empty spec with no action = DENY ALL (Istio default behavior)
+  {}
+
+# -----------------------------------------------------------------------------
+# 2. Allow Istio ingress gateway to reach application services (port 8080)
+#    Scope: pods labelled app: devsecops-app
+#    Source: SPIFFE principal of the ingress gateway service account
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingress-to-app
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-ingress
+  annotations:
+    description: >-
+      Permits the Istio ingress gateway to route HTTP/HTTPS traffic to
+      application pods on port 8080. Uses SPIFFE workload identity rather
+      than IP addresses for source validation.
+spec:
+  selector:
+    matchLabels:
+      app: devsecops-app
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # SPIFFE identity of the ingress gateway service account
+              - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+      to:
+        - operation:
+            methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+            ports: ["8080"]
+
+# -----------------------------------------------------------------------------
+# 3. Allow Prometheus to scrape metrics from app pods
+#    Scope: pods labelled app: devsecops-app
+#    Source: SPIFFE principal of the Prometheus service account
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-ingress
+  annotations:
+    description: >-
+      Permits the Prometheus server (monitoring namespace) to scrape
+      metrics from application pods via GET /metrics on port 8080.
+      Istio proxies automatically expose /stats/prometheus as well.
+spec:
+  selector:
+    matchLabels:
+      app: devsecops-app
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # SPIFFE identity of the Prometheus ServiceAccount
+              - "cluster.local/ns/monitoring/sa/prometheus-server"
+              - "cluster.local/ns/monitoring/sa/prometheus-kube-prometheus-prometheus"
+            namespaces:
+              - monitoring
+      to:
+        - operation:
+            methods: ["GET"]
+            paths:
+              - "/metrics"
+              - "/stats/prometheus"
+              - "/healthz"
+              - "/readyz"
+            ports: ["8080"]
+
+# -----------------------------------------------------------------------------
+# 4. Allow kubelet health check probes (no source principal for node traffic)
+#    Kubernetes liveness/readiness/startup probes originate from the node
+#    kubelet, which does not have an Istio sidecar or SPIFFE identity.
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-health-checks
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-ingress
+  annotations:
+    description: >-
+      Permits kubelet liveness, readiness, and startup probes to reach app
+      pods without a SPIFFE client identity. Kubelet originates from the
+      node network (not inside the mesh). Without this rule, pods fail
+      health checks and are continuously restarted.
+spec:
+  selector:
+    matchLabels:
+      app: devsecops-app
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            methods: ["GET"]
+            paths:
+              - "/healthz"
+              - "/readyz"
+              - "/livez"
+              - "/health"
+              - "/ping"
+
+# -----------------------------------------------------------------------------
+# 5. Allow app services to call other internal services within production
+#    Scope: service-to-service calls within the same namespace
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-internal
+  annotations:
+    description: >-
+      Permits service-to-service calls within the production namespace.
+      Services must present a valid SPIFFE SVID (mTLS). This allows
+      microservice communication without requiring individual policies for
+      every service pair.
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces:
+              - production
+
+# -----------------------------------------------------------------------------
+# 6. Allow ArgoCD to access the Kubernetes API for sync operations
+#    Scope: applies to the application-controller service account
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-argocd-sync
+  namespace: production
+  labels:
+    team: platform
+    environment: production
+    policy-type: allow-cicd
+  annotations:
+    description: >-
+      Permits the Argo CD application controller to apply manifests to the
+      production namespace during GitOps sync operations.
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/argocd/sa/argocd-application-controller"
+              - "cluster.local/ns/argocd/sa/argocd-server"
+
+# =============================================================================
+# STAGING NAMESPACE
+# More permissive — allows intra-namespace traffic and monitoring without
+# requiring individual per-service policies during development.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Staging — deny all by default
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: deny-all
+  annotations:
+    description: >-
+      Default-deny for staging. Traffic must be explicitly allowed.
+spec: {}
+
+# -----------------------------------------------------------------------------
+# Staging — allow all intra-namespace + ingress gateway + monitoring
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-staging-internal
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: allow-internal
+  annotations:
+    description: >-
+      Allows all traffic originating from within the staging namespace, the
+      Istio ingress gateway, and the monitoring namespace. Simplifies
+      developer workflows in staging without compromising production isolation.
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces:
+              - staging
+              - istio-system
+              - monitoring
+              - argocd
+
+# -----------------------------------------------------------------------------
+# Staging — allow kubelet health check probes
+# -----------------------------------------------------------------------------
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-health-checks
+  namespace: staging
+  labels:
+    team: platform
+    environment: staging
+    policy-type: allow-ingress
+spec:
+  selector:
+    matchLabels:
+      app: devsecops-app
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            methods: ["GET"]
+            paths:
+              - "/healthz"
+              - "/readyz"
+              - "/livez"
+              - "/health"
+              - "/ping"
