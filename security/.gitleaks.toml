@@ -1,0 +1,85 @@
+# Gitleaks configuration for detecting secrets and sensitive data.
+title = "DevSecOps Gitleaks Config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "azure-storage-key"
+description = "Azure Storage Account Key"
+regex = '''(?i)(AccountKey|StorageKey)\s*[=:]\s*[A-Za-z0-9+/]{86}=='''
+tags = ["azure", "storage", "key"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "azure-client-secret"
+description = "Azure Service Principal Client Secret"
+regex = '''(?i)(client[-_]?secret|AZURE_CLIENT_SECRET)\s*[=:]\s*[A-Za-z0-9~._-]{34,}'''
+tags = ["azure", "service-principal"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "azure-sas-token"
+description = "Azure SAS Token"
+regex = '''(?i)sig=[A-Za-z0-9%]+&?'''
+tags = ["azure", "sas"]
+severity = "HIGH"
+
+[[rules]]
+id = "acr-password"
+description = "Azure Container Registry Password"
+regex = '''(?i)(acr[-_]?password|ACR_PASSWORD)\s*[=:]\s*[A-Za-z0-9+/=]{20,}'''
+tags = ["azure", "acr"]
+severity = "HIGH"
+
+[[rules]]
+id = "k8s-service-account-token"
+description = "Kubernetes Service Account Token"
+regex = '''eyJhbGciOiJSUzI1NiIsImtpZCI[A-Za-z0-9_.-]+'''
+tags = ["kubernetes", "token"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "private-key-pem"
+description = "Private Key in PEM format"
+regex = '''-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'''
+tags = ["private-key", "crypto"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "cosign-private-key"
+description = "cosign private key"
+regex = '''-----BEGIN ENCRYPTED COSIGN PRIVATE KEY-----'''
+tags = ["cosign", "signing"]
+severity = "CRITICAL"
+
+[[rules]]
+id = "sonar-token"
+description = "SonarQube/SonarCloud Token"
+regex = '''(?i)(sonar[-_]?token|SONAR_TOKEN)\s*[=:]\s*[A-Za-z0-9]{40,}'''
+tags = ["sonar"]
+severity = "HIGH"
+
+[[rules]]
+id = "snyk-token"
+description = "Snyk API Token"
+regex = '''(?i)(snyk[-_]?token|SNYK_TOKEN)\s*[=:]\s*[A-Za-z0-9-]{36}'''
+tags = ["snyk"]
+severity = "HIGH"
+
+[allowlist]
+description = "Global allowlist"
+regexes = [
+  '''EXAMPLE_''',
+  '''placeholder''',
+  '''YOUR_.*_HERE''',
+  '''<.*>''',
+  '''\$\{.*\}''',
+]
+paths = [
+  '''\.pre-commit-config\.yaml''',
+  '''README\.md''',
+  '''\.gitleaks\.toml''',
+  '''.*_test\..*''',
+  '''.*\.example\..*''',
+]
