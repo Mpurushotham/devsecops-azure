@@ -1,0 +1,10 @@
+# ZAP scan rules configuration
+# Rule ID	Threshold	Strength
+# 10016	IGNORE	DEFAULT	Directory Browsing
+10016	IGNORE	DEFAULT
+# 10020	MEDIUM	DEFAULT	X-Frame-Options Header
+10020	MEDIUM	DEFAULT
+# 10021	MEDIUM	DEFAULT	X-Content-Type-Options Header
+10021	MEDIUM	DEFAULT
+# 10202	IGNORE	DEFAULT	Absence of Anti-CSRF Tokens (API endpoints)
+10202	IGNORE	DEFAULT
