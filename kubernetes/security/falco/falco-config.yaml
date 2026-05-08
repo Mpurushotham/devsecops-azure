@@ -1,0 +1,154 @@
+# =============================================================================
+# Falco Runtime Security — ConfigMap
+#
+# Configures the Falco daemon deployed via the official Helm chart
+# (falcosecurity/falco).  Key settings:
+#   - JSON output for structured log ingestion (SIEM / Falcosidekick)
+#   - gRPC server for Falcosidekick fan-out (Slack, PagerDuty, webhooks)
+#   - Minimum priority threshold: WARNING
+#   - Explicit rule file paths (base rules + custom overlay)
+#
+# Deploy to the 'security' namespace alongside the Falco DaemonSet.
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-config
+  namespace: security
+  labels:
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/component: config
+    team: security
+    environment: shared
+  annotations:
+    description: "Falco runtime security engine — main configuration"
+data:
+  # ---------------------------------------------------------------------------
+  # falco.yaml — primary configuration file mounted into /etc/falco/falco.yaml
+  # ---------------------------------------------------------------------------
+  falco.yaml: |
+    # -----------------------------------------------------------------------
+    # Rule files — loaded in order; later files can override earlier rules.
+    # -----------------------------------------------------------------------
+    rules_file:
+      - /etc/falco/falco_rules.yaml           # Falco upstream default rules
+      - /etc/falco/falco_rules.local.yaml     # Upstream local overrides
+      - /etc/falco/k8s_audit_rules.yaml       # Kubernetes audit log rules
+      - /etc/falco/custom_rules.yaml          # Organisation-specific rules
+
+    # -----------------------------------------------------------------------
+    # Output channels
+    # -----------------------------------------------------------------------
+
+    # Standard output (stdout) — picked up by container log aggregation
+    stdout_output:
+      enabled: true
+
+    # Syslog output — forwarded by the node's syslog daemon if configured
+    syslog_output:
+      enabled: false
+
+    # File output — useful for log rotation and offline analysis
+    file_output:
+      enabled: false
+      keep_alive: false
+      filename: /var/log/falco/falco.log
+
+    # JSON output — REQUIRED for Falcosidekick and structured SIEM ingestion
+    json_output: true
+    json_include_output_property: true
+    json_include_tags_property: true
+
+    # -----------------------------------------------------------------------
+    # gRPC server — Falcosidekick connects over Unix socket (recommended)
+    # or TCP for multi-node setups.
+    # -----------------------------------------------------------------------
+    grpc:
+      enabled: true
+      bind_address: "unix:///var/run/falco/falco.sock"
+      # Use threadiness: 0 to auto-detect CPU core count
+      threadiness: 0
+
+    grpc_output:
+      enabled: true
+
+    # -----------------------------------------------------------------------
+    # HTTP output (alternative to gRPC for simple webhook fan-out)
+    # -----------------------------------------------------------------------
+    http_output:
+      enabled: false
+      url: ""
+      user_agent: "falcosecurity/falco"
+      insecure: false
+      ca_cert: ""
+      ca_bundle: ""
+      ca_path: /etc/ssl/certs
+      mtls: false
+      client_cert: /etc/ssl/certs/client.crt
+      client_key: /etc/ssl/certs/client.key
+      echo: false
+      compress_uploads: false
+      keep_alive: false
+
+    # -----------------------------------------------------------------------
+    # Priority threshold
+    # Events below this priority are suppressed.
+    # Levels (ascending): DEBUG, INFORMATIONAL, NOTICE, WARNING, ERROR,
+    #                     CRITICAL, ALERT, EMERGENCY
+    # -----------------------------------------------------------------------
+    priority: WARNING
+
+    # -----------------------------------------------------------------------
+    # Buffered output — set false for real-time alerting
+    # -----------------------------------------------------------------------
+    buffered_outputs: false
+
+    # -----------------------------------------------------------------------
+    # Output format for non-JSON channels
+    # Includes Kubernetes metadata via %container.info and %k8s.*
+    # -----------------------------------------------------------------------
+    output_timeout: 2000
+
+    # -----------------------------------------------------------------------
+    # Log level for Falco's own operational messages (not security events)
+    # -----------------------------------------------------------------------
+    log_stderr: true
+    log_syslog: false
+    log_level: info
+
+    # -----------------------------------------------------------------------
+    # Syscall event drops
+    # -----------------------------------------------------------------------
+    syscall_event_drops:
+      actions:
+        - log
+        - alert
+      rate: 0.03333
+      max_burst: 10
+      simulate_drops: false
+
+    # -----------------------------------------------------------------------
+    # Metrics / health
+    # -----------------------------------------------------------------------
+    webserver:
+      enabled: true
+      listen_port: 8765
+      k8s_healthz_endpoint: /healthz
+      ssl_enabled: false
+      ssl_certificate: /etc/falco/certs/server.pem
+
+    # -----------------------------------------------------------------------
+    # Kubernetes metadata enrichment (requires RBAC — see falco-rbac below)
+    # -----------------------------------------------------------------------
+    metadata_download:
+      max_mb: 100
+      chunk_wait_us: 1000
+      watch_freq_sec: 1
+
+    # -----------------------------------------------------------------------
+    # Container engine — auto-detect (CRI-O / containerd on AKS)
+    # -----------------------------------------------------------------------
+    container_engines:
+      - cri
+      - containerd
