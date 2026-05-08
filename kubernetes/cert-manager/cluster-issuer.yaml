@@ -1,0 +1,258 @@
+# =============================================================================
+# cert-manager ClusterIssuers — AKS Certificate Lifecycle Management
+#
+# Four issuers / resources defined:
+#
+#   1. selfsigned-issuer       — Self-signed certificates (CA bootstrap only)
+#   2. cluster-root-ca         — Certificate: the cluster root CA
+#   3. internal-ca             — ClusterIssuer backed by cluster root CA
+#   4. letsencrypt-staging     — Let's Encrypt staging (test / dev)
+#   5. letsencrypt-prod        — Let's Encrypt production (internet-facing)
+#
+# DNS-01 challenge is used for all ACME issuers — enables wildcard certificates
+# and works without requiring a public ingress endpoint. Requires the cert-manager
+# Azure DNS webhook and appropriate Azure permissions.
+#
+# Authentication:
+#   Workload Identity (recommended for AKS) — annotate the cert-manager
+#   ServiceAccount with azure.workload.identity/client-id and bind a
+#   User-Assigned Managed Identity with DNS Zone Contributor role.
+#   Alternatively use a Service Principal via Secret (see comments below).
+#
+# Substitutions required before applying:
+#   <AZURE_SUBSCRIPTION_ID>    — Azure subscription containing the DNS zone
+#   <AZURE_DNS_RESOURCE_GROUP> — Resource group of the Azure DNS zone
+#   <AZURE_DNS_ZONE>           — DNS zone name (e.g., example.com)
+#   <AZURE_MI_CLIENT_ID>       — Managed Identity / Service Principal client ID
+#   <ACME_EMAIL>               — Email for Let's Encrypt expiry notifications
+# =============================================================================
+
+# =============================================================================
+# 1. Self-Signed Issuer
+#    Used only to bootstrap the cluster internal CA.
+#    Do NOT use this issuer for service certificates — it produces certs
+#    that are not trusted by any external trust anchor.
+# =============================================================================
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+  labels:
+    team: platform
+    environment: shared
+    issuer-type: selfsigned
+  annotations:
+    description: >-
+      Bootstrap self-signed ClusterIssuer. Used exclusively to sign the
+      cluster root CA Certificate. Not for service TLS certificates.
+spec:
+  selfSigned: {}
+
+# =============================================================================
+# 2. Cluster Root CA Certificate
+#    A CA certificate signed by the selfsigned-issuer. This becomes the
+#    trust anchor for all certificates issued by the internal-ca ClusterIssuer.
+# =============================================================================
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cluster-root-ca
+  namespace: cert-manager
+  labels:
+    team: platform
+    environment: shared
+    cert-type: root-ca
+  annotations:
+    description: >-
+      Cluster-internal Root CA. Private key and certificate stored in
+      'cluster-root-ca-secret'. Referenced by the internal-ca ClusterIssuer.
+      Rotate in line with your cluster lifecycle (default: 10 years).
+spec:
+  isCA: true
+  commonName: cluster-internal-root-ca
+  subject:
+    organizations:
+      - MyOrg Platform Engineering
+    organizationalUnits:
+      - AKS Cluster PKI
+    countries:
+      - GB
+  # 10-year root CA lifetime; rotate during cluster major upgrades
+  duration: 87600h
+  # Renew 30 days before expiry (cert-manager handles rotation automatically)
+  renewBefore: 720h
+  secretName: cluster-root-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+
+# =============================================================================
+# 3. Internal CA ClusterIssuer
+#    Issues TLS certificates for internal services signed by the cluster
+#    root CA. Use for: webhook TLS, Falco gRPC, monitoring stack, Istio
+#    custom CA integration, internal API endpoints.
+# =============================================================================
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: internal-ca
+  labels:
+    team: platform
+    environment: shared
+    issuer-type: internal-ca
+  annotations:
+    description: >-
+      Internal CA ClusterIssuer backed by the cluster root CA secret.
+      Issues short-lived certificates (90 days default) for cluster-internal
+      services. Certificates are trusted by services that mount the root CA
+      ConfigMap/Secret but not by external browsers or OS trust stores.
+spec:
+  ca:
+    # References the Secret created by the cluster-root-ca Certificate above
+    secretName: cluster-root-ca-secret
+
+# =============================================================================
+# 4. Let's Encrypt — Staging
+#    Use for integration testing and DNS configuration validation.
+#    Certificates are signed by an untrusted CA — not valid for production use.
+#    Rate limits are much higher than production (~30,000 requests/day).
+# =============================================================================
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+  labels:
+    team: platform
+    environment: staging
+    issuer-type: acme-staging
+  annotations:
+    description: >-
+      Let's Encrypt staging ACME issuer. DNS-01 via Azure DNS. Certificates
+      are signed by an untrusted Fake LE Root — use only for testing ACME
+      DNS configuration. Switch to letsencrypt-prod for real certificates.
+spec:
+  acme:
+    # ACME v2 staging endpoint (untrusted root, high rate limits)
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+
+    # Email for certificate lifecycle notifications
+    email: <ACME_EMAIL>
+
+    # Stores the ACME account private key
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+
+    solvers:
+      # -----------------------------------------------------------------
+      # DNS-01 solver via Azure DNS
+      # Supports wildcard certificates (*.example.com) and eliminates
+      # the need for a public HTTP endpoint during challenge validation.
+      # -----------------------------------------------------------------
+      - dns01:
+          azureDNS:
+            subscriptionID: <AZURE_SUBSCRIPTION_ID>
+            resourceGroupName: <AZURE_DNS_RESOURCE_GROUP>
+            hostedZoneName: <AZURE_DNS_ZONE>
+            environment: AzurePublicCloud
+            # Workload Identity (recommended for AKS managed identity)
+            managedIdentity:
+              clientID: <AZURE_MI_CLIENT_ID>
+            # -----------------------------------------------------------
+            # Alternative: Service Principal authentication
+            # Uncomment the block below and comment out managedIdentity:
+            # tenantID: <AZURE_TENANT_ID>
+            # clientID: <AZURE_CLIENT_ID>
+            # clientSecretSecretRef:
+            #   name: azuredns-sp-secret
+            #   key: client-secret
+            # -----------------------------------------------------------
+        selector:
+          dnsZones:
+            - "<AZURE_DNS_ZONE>"
+            - "*.<AZURE_DNS_ZONE>"
+
+# =============================================================================
+# 5. Let's Encrypt — Production
+#    Rate-limited to 50 certificates per registered domain per week.
+#    Use the staging issuer first to validate your configuration.
+#    Certificates are trusted by all major browsers and OS trust stores.
+# =============================================================================
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+  labels:
+    team: platform
+    environment: production
+    issuer-type: acme-production
+  annotations:
+    description: >-
+      Let's Encrypt production ACME issuer. DNS-01 via Azure DNS. Rate-limited
+      (50 certs/domain/week). Validate configuration with letsencrypt-staging
+      first. Certificates are trusted by all major browsers and OS stores.
+spec:
+  acme:
+    # ACME v2 production endpoint
+    server: https://acme-v02.api.letsencrypt.org/directory
+
+    email: <ACME_EMAIL>
+
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+
+    solvers:
+      - dns01:
+          azureDNS:
+            subscriptionID: <AZURE_SUBSCRIPTION_ID>
+            resourceGroupName: <AZURE_DNS_RESOURCE_GROUP>
+            hostedZoneName: <AZURE_DNS_ZONE>
+            environment: AzurePublicCloud
+            managedIdentity:
+              clientID: <AZURE_MI_CLIENT_ID>
+        selector:
+          dnsZones:
+            - "<AZURE_DNS_ZONE>"
+            - "*.<AZURE_DNS_ZONE>"
+
+# =============================================================================
+# Reference: Example Certificate using letsencrypt-prod
+# Uncomment and customise to issue a real certificate.
+# =============================================================================
+# ---
+# apiVersion: cert-manager.io/v1
+# kind: Certificate
+# metadata:
+#   name: app-tls-cert
+#   namespace: production
+#   labels:
+#     team: platform
+#     environment: production
+# spec:
+#   secretName: app-tls-secret
+#   duration: 2160h       # 90 days (Let's Encrypt default)
+#   renewBefore: 360h     # Renew 15 days before expiry
+#   subject:
+#     organizations:
+#       - MyOrg
+#   commonName: app.example.com
+#   dnsNames:
+#     - app.example.com
+#     - "*.app.example.com"
+#   privateKey:
+#     algorithm: ECDSA
+#     size: 256
+#     rotationPolicy: Always
+#   issuerRef:
+#     name: letsencrypt-prod
+#     kind: ClusterIssuer
+#     group: cert-manager.io
