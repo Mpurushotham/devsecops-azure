@@ -1,0 +1,224 @@
+{
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "description": "SLO Dashboard — availability, error rate, latency, burn rate, deployment metrics",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Service Availability (Target: 99.9%)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0.99,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.999},
+              {"color": "green", "value": 0.9999}
+            ]
+          },
+          "custom": {"lineWidth": 2, "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "SLO Target (99.9%)"},
+            "properties": [
+              {"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}},
+              {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [5, 5]}},
+              {"id": "custom.lineWidth", "value": 2}
+            ]
+          }
+        ]
+      },
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "expr": "1 - (sum(increase(http_requests_total{status=~\"5..\",namespace=~\"$namespace\"}[5m])) / sum(increase(http_requests_total{namespace=~\"$namespace\"}[5m])))",
+          "legendFormat": "Availability",
+          "refId": "A"
+        },
+        {
+          "expr": "vector(0.999)",
+          "legendFormat": "SLO Target (99.9%)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {"lineWidth": 2, "fillOpacity": 15},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.005},
+              {"color": "red", "value": 0.01}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(http_requests_total{status=~\"5..\",namespace=~\"$namespace\"}[5m])) / sum by (service) (rate(http_requests_total{namespace=~\"$namespace\"}[5m]))",
+          "legendFormat": "{{service}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Request Latency (P50/P90/P99)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"lineWidth": 2}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "p99"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "p90"}, "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "p50"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]}
+        ]
+      },
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.90, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))", "legendFormat": "p90", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))", "legendFormat": "p99", "refId": "C"},
+        {"expr": "vector(0.5)", "legendFormat": "500ms SLO", "refId": "D"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Error Budget Remaining",
+      "type": "gauge",
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.1},
+              {"color": "green", "value": 0.25}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "expr": "1 - ((1 - (sum(increase(http_requests_total{status=~\"5..\",namespace=~\"$namespace\"}[30d])) / sum(increase(http_requests_total{namespace=~\"$namespace\"}[30d])))) / (1 - 0.999))",
+          "legendFormat": "Error Budget",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "SLO Burn Rate (Fast: 1h, Slow: 6h)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 18, "x": 6, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"lineWidth": 2},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 14}
+            ]
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Fast (1h)"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Slow (6h)"}, "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]}
+        ]
+      },
+      "targets": [
+        {
+          "expr": "(sum(rate(http_requests_total{status=~\"5..\",namespace=~\"$namespace\"}[1h])) / sum(rate(http_requests_total{namespace=~\"$namespace\"}[1h]))) / (1 - 0.999)",
+          "legendFormat": "Fast (1h)",
+          "refId": "A"
+        },
+        {
+          "expr": "(sum(rate(http_requests_total{status=~\"5..\",namespace=~\"$namespace\"}[6h])) / sum(rate(http_requests_total{namespace=~\"$namespace\"}[6h]))) / (1 - 0.999)",
+          "legendFormat": "Slow (6h)",
+          "refId": "B"
+        },
+        {"expr": "vector(14)", "legendFormat": "Alert threshold (14x)", "refId": "C"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Deployment Frequency & Change Failure Rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 12, "x": 0, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "thresholds"}},
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "orientation": "horizontal"},
+      "targets": [
+        {"expr": "increase(deployment_count_total{namespace=~\"$namespace\"}[7d])", "legendFormat": "Deployments (7d)", "refId": "A"},
+        {"expr": "increase(deployment_failures_total{namespace=~\"$namespace\"}[7d]) / increase(deployment_count_total{namespace=~\"$namespace\"}[7d])", "legendFormat": "Change Failure Rate", "refId": "B"}
+      ]
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "tags": ["slo", "availability", "devsecops"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "pluginId": "prometheus",
+        "label": "Prometheus",
+        "current": {}
+      },
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(kube_namespace_labels, namespace)",
+        "label": "Namespace",
+        "multi": true,
+        "includeAll": true,
+        "current": {}
+      }
+    ]
+  },
+  "time": {"from": "now-24h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "DevSecOps — SLO Dashboard",
+  "uid": "devsecops-slo",
+  "version": 1
+}
