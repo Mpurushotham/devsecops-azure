@@ -1,0 +1,169 @@
+# =============================================================================
+# Kubernetes Namespaces — AKS Cluster Security Baseline
+#
+# Defines all operational namespaces with consistent labeling for:
+#   - Policy enforcement targeting (Kyverno, NetworkPolicy, Istio)
+#   - Kubernetes Pod Security Standards (PSS) admission labels
+#   - Environment and team ownership metadata
+#   - Istio sidecar injection control
+#
+# Security tiers:
+#   restricted  — Production workloads; strictest controls enforced
+#   standard    — Staging / shared tooling; baseline controls enforced
+#   privileged  — System components (Istio, cert-manager); exempted from
+#                 restrictive admission policies that would break them
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    # Ownership / routing labels
+    team: platform
+    environment: production
+    security-tier: restricted
+    # Kubernetes Pod Security Standards — enforce the most restrictive profile
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    # Istio automatic sidecar injection
+    istio-injection: enabled
+  annotations:
+    contact: platform-team@example.com
+    description: >-
+      Production workloads — restricted security tier. All Kyverno enforce
+      policies apply. mTLS STRICT. Default-deny network policies in effect.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    team: platform
+    environment: staging
+    security-tier: standard
+    # Enforce baseline PSS; warn on restricted violations to prepare for prod
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    istio-injection: enabled
+  annotations:
+    contact: platform-team@example.com
+    description: >-
+      Staging / pre-production workloads — baseline security tier.
+      Kyverno policies in Audit mode for most rules. mTLS PERMISSIVE.
+      Default-deny network policies in effect.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security
+  labels:
+    team: security
+    environment: shared
+    security-tier: privileged
+    # Security tooling (Falco, Kyverno admission controller) needs elevated
+    # privileges — exempt from the pod security restricted profile
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    # Exclude from Kyverno enforcement policies that would block Falco DaemonSet
+    kyverno.io/exclude: "true"
+  annotations:
+    contact: security-team@example.com
+    description: >-
+      Security tooling namespace — Falco DaemonSet, Kyverno policies,
+      Trivy Operator, Kubescape. Privileged PSS required for host access.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    team: platform
+    environment: shared
+    security-tier: standard
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    # Prometheus needs to scrape across namespaces — inject Istio sidecar
+    istio-injection: enabled
+  annotations:
+    contact: platform-team@example.com
+    description: >-
+      Observability stack — Prometheus, Grafana, Alertmanager,
+      Loki, OpenTelemetry Collector. Scrapes metrics from all namespaces.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+  labels:
+    team: platform
+    environment: shared
+    security-tier: privileged
+    # Istio control-plane pods require privileged access; exempt from policies
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    # Prevent Kyverno enforce policies from blocking Istio control-plane pods
+    kyverno.io/exclude: "true"
+    # Do NOT add istio-injection here — this is the control plane namespace
+  annotations:
+    contact: platform-team@example.com
+    description: >-
+      Istio service-mesh control plane — istiod, ingress gateway, egress
+      gateway, Envoy proxies. Exempt from pod security admission enforcement.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager
+  labels:
+    team: platform
+    environment: shared
+    security-tier: privileged
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    kyverno.io/exclude: "true"
+  annotations:
+    contact: platform-team@example.com
+    description: >-
+      cert-manager certificate lifecycle controller. Manages TLS issuance
+      via Let's Encrypt (DNS-01/HTTP-01) and the internal cluster CA.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    team: platform
+    environment: shared
+    security-tier: standard
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    istio-injection: enabled
+  annotations:
+    contact: platform-team@example.com
+    description: >-
+      Argo CD GitOps continuous delivery controller. Manages application
+      deployment from Git repositories to production and staging namespaces.
