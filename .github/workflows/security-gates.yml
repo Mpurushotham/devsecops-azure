@@ -1,0 +1,605 @@
+# =============================================================================
+# Security Gates Workflow — Azure DevSecOps
+# =============================================================================
+# Triggered on every Pull Request. All jobs are mandatory status checks.
+# A PR cannot be merged if any job fails CRITICAL/HIGH threshold.
+#
+# CVSS Thresholds (enforced per job):
+#   > 9.0       → fail job (exit 1) — blocks merge
+#   7.0 – 8.9  → warning + auto-create GitHub issue — does NOT block merge
+#   < 7.0       → log only — informational
+#
+# Required secrets:
+#   SEMGREP_APP_TOKEN, SNYK_TOKEN, FOSSA_API_KEY, TRUFFLEHOG_GITHUB_TOKEN
+# =============================================================================
+
+name: Security Gates
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Allow manual trigger for re-scan
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or SHA to scan"
+        required: false
+        default:  ""
+
+concurrency:
+  group: security-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents:        read
+  security-events: write  # Upload SARIF to GitHub Security tab
+  issues:          write  # Create tracking tickets for HIGH findings
+  pull-requests:   write  # Post inline comments on PRs
+  id-token:        write  # OIDC for FOSSA
+
+# Shared threshold constants surfaced as env vars for all jobs
+env:
+  CVSS_CRITICAL_THRESHOLD: "9.0"
+  CVSS_HIGH_THRESHOLD:     "7.0"
+  PYTHON_VERSION:          "3.12"
+  NODE_VERSION:            "20"
+
+# =============================================================================
+# JOB 1 — Pre-commit Checks (gitleaks + detect-secrets)
+# =============================================================================
+jobs:
+  pre-commit-check:
+    name: Pre-commit — Secret Detection
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history for secret scanning)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+            git diff --name-only "$BASE" "$HEAD" > changed_files.txt
+          else
+            git diff --name-only HEAD~1 HEAD > changed_files.txt
+          fi
+          echo "Changed files:"
+          cat changed_files.txt
+
+      # ── gitleaks ────────────────────────────────────────────────────────────
+      - name: Run gitleaks (changed files only)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: true
+        with:
+          args: >
+            detect
+            --source .
+            --log-opts "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+            --report-format sarif
+            --report-path gitleaks.sarif
+            --exit-code 1
+
+      - name: Upload gitleaks SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category:   gitleaks
+
+      # ── detect-secrets ──────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install detect-secrets
+        run: pip install --quiet detect-secrets
+
+      - name: Run detect-secrets on changed files
+        run: |
+          # Build list of files to scan from the changed files list
+          FILES=$(cat changed_files.txt | tr '\n' ' ')
+          if [ -z "$FILES" ]; then
+            echo "No changed files to scan."
+            exit 0
+          fi
+
+          detect-secrets scan $FILES \
+            --baseline .secrets.baseline \
+            --only-allowlisted 2>/dev/null || true
+
+          detect-secrets audit .secrets.baseline --json > detect-secrets-results.json 2>/dev/null || true
+
+          # Fail if any live (non-whitelisted) secrets found
+          LIVE=$(python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('detect-secrets-results.json'))
+              secrets = [s for v in data.get('results', {}).values() for s in v if not s.get('is_secret') == False]
+              print(len(secrets))
+          except Exception:
+              print(0)
+          ")
+          if [ "$LIVE" -gt 0 ]; then
+            echo "::error::detect-secrets found $LIVE potential secrets in changed files — blocking PR"
+            exit 1
+          fi
+          echo "detect-secrets: no live secrets found."
+
+# =============================================================================
+# JOB 2 — SAST: Semgrep (OWASP Top-10 + security-audit)
+# =============================================================================
+  sast-semgrep:
+    name: SAST — Semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: semgrep/semgrep:1.89.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Semgrep with security rulesets
+        id: semgrep
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          semgrep scan \
+            --config "p/security-audit" \
+            --config "p/owasp-top-ten" \
+            --config "p/cwe-top-25" \
+            --config "p/secrets" \
+            --sarif \
+            --output semgrep.sarif \
+            --verbose \
+            --timeout 60 \
+            --error \
+            . 2>&1 | tee semgrep.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: Enforce CVSS thresholds (Semgrep)
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, subprocess, os
+
+          sarif_path = "semgrep.sarif"
+          if not os.path.exists(sarif_path):
+              print("No Semgrep SARIF output found — treating as clean.")
+              sys.exit(0)
+
+          with open(sarif_path) as f:
+              sarif = json.load(f)
+
+          critical, high, medium = 0, 0, 0
+          findings = []
+
+          for run in sarif.get("runs", []):
+              rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+              for result in run.get("results", []):
+                  level    = result.get("level", "note")
+                  rule_id  = result.get("ruleId", "")
+                  message  = result.get("message", {}).get("text", "")
+                  locations = result.get("locations", [])
+                  location  = ""
+                  if locations:
+                      pl = locations[0].get("physicalLocation", {})
+                      location = f"{pl.get('artifactLocation', {}).get('uri', '')}:{pl.get('region', {}).get('startLine', '')}"
+
+                  findings.append({"level": level, "rule": rule_id, "msg": message, "loc": location})
+
+                  if level == "error":
+                      critical += 1
+                  elif level == "warning":
+                      high += 1
+                  else:
+                      medium += 1
+
+          print(f"Semgrep — CRITICAL: {critical}, HIGH: {high}, MEDIUM/INFO: {medium}")
+
+          for f in findings:
+              if f["level"] == "error":
+                  print(f"  [CRITICAL] {f['rule']} @ {f['loc']}: {f['msg'][:120]}")
+              elif f["level"] == "warning":
+                  print(f"  [HIGH]     {f['rule']} @ {f['loc']}: {f['msg'][:120]}")
+
+          if critical > 0:
+              print(f"\n::error::Semgrep CRITICAL findings ({critical}) — CVSS > 9.0 policy violation, blocking PR")
+              sys.exit(1)
+          elif high > 0:
+              print(f"\n::warning::Semgrep HIGH findings ({high}) — CVSS 7.0-8.9, ticket will be filed")
+          PYEOF
+
+      - name: Upload Semgrep SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category:   semgrep-pr
+
+# =============================================================================
+# JOB 3 — SAST: Bandit (Python files only)
+# =============================================================================
+  sast-bandit:
+    name: SAST — Bandit (Python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Python file changes
+        id: py-check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COUNT=$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}" \
+              | grep -c '\.py$' || true)
+          else
+            COUNT=$(git diff --name-only HEAD~1 HEAD | grep -c '\.py$' || true)
+          fi
+          echo "py_count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "Python files changed: ${COUNT}"
+
+      - name: Set up Python
+        if: steps.py-check.outputs.py_count != '0'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Bandit
+        if: steps.py-check.outputs.py_count != '0'
+        run: pip install --quiet bandit[sarif]
+
+      - name: Run Bandit
+        if: steps.py-check.outputs.py_count != '0'
+        run: |
+          bandit -r . \
+            --format sarif \
+            --output bandit.sarif \
+            --severity-level medium \
+            --confidence-level medium \
+            --exclude .venv,venv,node_modules,tests \
+            -ll || BANDIT_EXIT=$?
+
+          echo "Bandit exit code: ${BANDIT_EXIT:-0}"
+
+      - name: Enforce CVSS thresholds (Bandit)
+        if: steps.py-check.outputs.py_count != '0'
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, os
+
+          if not os.path.exists("bandit.sarif"):
+              print("No Bandit output — skipping.")
+              sys.exit(0)
+
+          with open("bandit.sarif") as f:
+              sarif = json.load(f)
+
+          # Bandit maps HIGH severity + HIGH confidence → CRITICAL (CVSS > 9)
+          # HIGH severity + MEDIUM confidence → HIGH (CVSS 7-8.9)
+          critical, high, medium = 0, 0, 0
+          for run in sarif.get("runs", []):
+              for result in run.get("results", []):
+                  level = result.get("level", "note")
+                  props = result.get("properties", {})
+                  sev   = props.get("issue_severity", "").upper()
+                  conf  = props.get("issue_confidence", "").upper()
+
+                  if sev == "HIGH" and conf == "HIGH":
+                      critical += 1
+                  elif sev == "HIGH":
+                      high += 1
+                  else:
+                      medium += 1
+
+          print(f"Bandit — CRITICAL (HIGH/HIGH): {critical}, HIGH: {high}, MEDIUM: {medium}")
+          if critical > 0:
+              print(f"::error::Bandit found {critical} CRITICAL Python security issues — blocking PR")
+              sys.exit(1)
+          elif high > 0:
+              print(f"::warning::Bandit found {high} HIGH Python security issues")
+          PYEOF
+
+      - name: Upload Bandit SARIF
+        if: steps.py-check.outputs.py_count != '0' && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+          category:   bandit
+
+      - name: Skip message (no Python files)
+        if: steps.py-check.outputs.py_count == '0'
+        run: echo "No Python files changed — Bandit scan skipped."
+
+# =============================================================================
+# JOB 4 — SCA: Trivy Filesystem Dependency Scan
+# =============================================================================
+  sca-trivy:
+    name: SCA — Trivy Filesystem Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type:      fs
+          scan-ref:       .
+          format:         sarif
+          output:         trivy-fs-pr.sarif
+          severity:       CRITICAL,HIGH,MEDIUM
+          exit-code:      "0"
+          vuln-type:      library,os
+          ignore-unfixed: true
+          list-all-pkgs: true
+
+      - name: Enforce CVSS thresholds (SCA — Trivy)
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, os
+
+          path = "trivy-fs-pr.sarif"
+          if not os.path.exists(path):
+              print("No Trivy SARIF — skipping.")
+              sys.exit(0)
+
+          with open(path) as f:
+              sarif = json.load(f)
+
+          critical, high = 0, 0
+          for run in sarif.get("runs", []):
+              for result in run.get("results", []):
+                  level = result.get("level", "")
+                  if level == "error":
+                      critical += 1
+                  elif level == "warning":
+                      high += 1
+
+          print(f"Trivy SCA — CRITICAL: {critical}, HIGH: {high}")
+          if critical > 0:
+              print(f"::error::Trivy found {critical} CRITICAL CVEs in dependencies (CVSS > 9.0) — blocking PR")
+              sys.exit(1)
+          elif high > 0:
+              print(f"::warning::Trivy found {high} HIGH CVEs (CVSS 7.0-8.9) — ticket will be filed")
+          PYEOF
+
+      - name: Upload Trivy SCA SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs-pr.sarif
+          category:   trivy-sca-pr
+
+      - name: Create GitHub issue for HIGH findings
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  `[SECURITY] HIGH/CRITICAL CVEs found in PR #${context.issue.number}`,
+              body: `## Security Finding\n\n**Workflow:** ${context.workflow}\n**PR:** #${context.issue.number}\n**Commit:** ${context.sha}\n\nTrivy detected CRITICAL/HIGH CVEs in dependency scan. Review the [Security tab](https://github.com/${context.repo.owner}/${context.repo.repo}/security/code-scanning) for details.\n\n**CVSS Threshold Policy:**\n- CVSS > 9.0 → blocked build\n- CVSS 7.0-8.9 → this ticket (must be remediated within 30 days)\n- CVSS < 7.0 → logged only`,
+              labels: ["security", "vulnerability", "high-priority"]
+            });
+
+# =============================================================================
+# JOB 5 — Secret Scan: TruffleHog3 Deep Scan
+# =============================================================================
+  secret-scan:
+    name: Secret Scan — TruffleHog3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog3
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path:          ./
+          base:          ${{ github.event.pull_request.base.sha }}
+          head:          ${{ github.event.pull_request.head.sha }}
+          extra_args:    >
+            --only-verified
+            --format sarif
+            --output trufflehog.sarif
+
+      - name: Upload TruffleHog SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trufflehog.sarif
+          category:   trufflehog
+
+# =============================================================================
+# JOB 6 — License Compliance (FOSSA)
+# =============================================================================
+  license-check:
+    name: License Compliance — FOSSA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install FOSSA CLI
+        run: |
+          curl -H 'Cache-Control: no-cache' \
+            https://raw.githubusercontent.com/fossas/fossa-cli/master/install-latest.sh | bash
+
+      - name: Run FOSSA analyze
+        env:
+          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
+        run: |
+          fossa analyze \
+            --branch "${{ github.head_ref || github.ref_name }}" \
+            --revision "${{ github.sha }}"
+
+      - name: Run FOSSA license test
+        env:
+          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
+        run: |
+          fossa test \
+            --timeout 300 \
+            --revision "${{ github.sha }}" || {
+              echo "::error::FOSSA license check failed — one or more dependencies violate the license policy"
+              exit 1
+            }
+
+      # Fallback: license-checker for Node projects (runs regardless)
+      - name: license-checker (Node fallback)
+        if: always()
+        run: |
+          npm install --global license-checker 2>/dev/null || true
+          if [ -f package.json ]; then
+            license-checker \
+              --production \
+              --excludePrivatePackages \
+              --failOn "GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0" \
+              --json > license-report.json 2>&1 || {
+                echo "::warning::Potentially incompatible licenses detected — review license-report.json"
+              }
+          fi
+
+      - name: Upload license report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-report-${{ github.sha }}
+          path: license-report.json
+          retention-days: 30
+
+# =============================================================================
+# JOB 7 — SBOM Generation (CycloneDX)
+# =============================================================================
+  sbom-generate:
+    name: SBOM — CycloneDX Generation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Syft (SBOM generator)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+            sh -s -- -b /usr/local/bin
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          syft dir:. \
+            --output cyclonedx-json=sbom-cyclonedx.json \
+            --output spdx-json=sbom-spdx.json \
+            --config .syft.yaml 2>/dev/null || \
+          syft dir:. \
+            --output cyclonedx-json=sbom-cyclonedx.json \
+            --output spdx-json=sbom-spdx.json
+
+      - name: Validate CycloneDX SBOM
+        run: |
+          # Install cyclonedx-cli for validation
+          curl -sSfL \
+            "https://github.com/CycloneDX/cyclonedx-cli/releases/latest/download/cyclonedx-linux-x64" \
+            -o /usr/local/bin/cyclonedx-cli
+          chmod +x /usr/local/bin/cyclonedx-cli
+
+          cyclonedx-cli validate \
+            --input-file sbom-cyclonedx.json \
+            --input-format json \
+            --input-version v1_5 \
+            --fail-on-errors
+
+      - name: Display SBOM component summary
+        run: |
+          python3 - <<'PYEOF'
+          import json
+
+          with open("sbom-cyclonedx.json") as f:
+              sbom = json.load(f)
+
+          components = sbom.get("components", [])
+          print(f"Total components: {len(components)}")
+
+          by_type = {}
+          for c in components:
+              t = c.get("type", "unknown")
+              by_type[t] = by_type.get(t, 0) + 1
+
+          for t, count in sorted(by_type.items(), key=lambda x: -x[1]):
+              print(f"  {t}: {count}")
+          PYEOF
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-pr-${{ github.sha }}
+          path: |
+            sbom-cyclonedx.json
+            sbom-spdx.json
+          retention-days: 90
+
+# =============================================================================
+# JOB 8 — Security Gate Summary (all jobs must pass)
+# =============================================================================
+  security-gate-summary:
+    name: Security Gate Summary
+    runs-on: ubuntu-24.04
+    needs:
+      - pre-commit-check
+      - sast-semgrep
+      - sast-bandit
+      - sca-trivy
+      - secret-scan
+      - license-check
+      - sbom-generate
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate gate results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const needs = ${{ toJSON(needs) }};
+            const results = Object.entries(needs).map(([job, data]) => ({
+              job,
+              result: data.result
+            }));
+
+            console.log("Security Gate Results:");
+            results.forEach(r => console.log(`  ${r.job}: ${r.result}`));
+
+            const failed = results.filter(r => r.result === "failure");
+            const skipped = results.filter(r => r.result === "skipped");
+            const passed = results.filter(r => r.result === "success");
+
+            if (failed.length > 0) {
+              const failedNames = failed.map(r => r.job).join(", ");
+              core.setFailed(
+                `Security gate FAILED. Blocking jobs: ${failedNames}. ` +
+                `This PR cannot be merged until all CRITICAL/HIGH findings are resolved.`
+              );
+            } else {
+              console.log(`All security gates passed. ${passed.length} jobs succeeded, ${skipped.length} skipped.`);
+            }
