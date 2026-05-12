@@ -82,4 +82,5 @@ paths = [
   '''\.gitleaks\.toml''',
   '''.*_test\..*''',
   '''.*\.example\..*''',
+  '''\.secrets\.baseline''',
 ]
