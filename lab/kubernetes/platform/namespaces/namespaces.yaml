@@ -1,0 +1,130 @@
+# =============================================================================
+# Namespaces
+# =============================================================================
+# Pod Security Standards are applied here rather than per-workload: a namespace
+# label cannot be forgotten by a service team, and `restricted` blocks the same
+# things Kyverno does at a second layer. Defence in depth is deliberate — PSA is
+# built into the API server and keeps enforcing if Kyverno is unavailable.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+  labels:
+    name: payments
+    app.kubernetes.io/part-of: platform
+    # Handles cardholder-adjacent traffic; drives policy and cost reporting.
+    data-class: confidential
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+    # Required for the OTel collector's NetworkPolicy selectors.
+    kubernetes.io/metadata.name: payments
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments-jobs
+  labels:
+    name: payments-jobs
+    app.kubernetes.io/part-of: platform
+    data-class: confidential
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    kubernetes.io/metadata.name: payments-jobs
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    name: observability
+    app.kubernetes.io/part-of: platform
+    # Collector agents need hostPath access for node-level logs, which
+    # `restricted` forbids.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    kubernetes.io/metadata.name: observability
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-nginx
+  labels:
+    name: ingress-nginx
+    app.kubernetes.io/part-of: platform
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    kubernetes.io/metadata.name: ingress-nginx
+
+---
+# Default-deny for the payments namespace. Every allow is then explicit and
+# reviewable in the service's own chart.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: payments
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: payments-jobs
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# A namespace-level quota is the backstop against one service exhausting the
+# cluster during a spike and starving every other workload.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payments-quota
+  namespace: payments
+spec:
+  hard:
+    requests.cpu: "80"
+    requests.memory: 160Gi
+    limits.memory: 200Gi
+    pods: "200"
+    # Secrets come from Key Vault via CSI; a rising count here means someone
+    # is creating them by hand.
+    count/secrets: "20"
+
+---
+# A pod with no requests is unschedulable-by-accident and invisible to the
+# autoscaler. LimitRange gives every container a floor.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: payments-defaults
+  namespace: payments
+spec:
+  limits:
+    - type: Container
+      default:
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 256Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+      min:
+        cpu: 10m
+        memory: 64Mi

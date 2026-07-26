@@ -4,12 +4,10 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# No build toolchain: every pinned dependency publishes a manylinux wheel, so
+# gcc and libffi-dev are unnecessary. Dropping them removes an unpinned
+# apt-get install (hadolint DL3008), shrinks the builder stage and eliminates a
+# class of build-time supply-chain exposure.
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
@@ -26,11 +24,15 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY --chown=appuser:appgroup src/ ./src/
 
-# Security hardening
-RUN apt-get update && apt-get upgrade -y && \
-    apt-get remove --purge -y gcc && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
-    find / -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
+# Security hardening: strip setuid/setgid bits so a compromised process cannot
+# escalate through a stray privileged binary.
+#
+# Deliberately no `apt-get upgrade` here. It makes the build non-reproducible —
+# the same Dockerfile and the same pins produce different packages depending on
+# when it ran — and it silently masks a stale base image. Base-image CVEs are
+# addressed by rebuilding on a newer python:3.12-slim digest, which Trivy
+# catches in the image scan.
+RUN find / -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
 
 # Drop all capabilities — app should not need any
 USER appuser
@@ -39,9 +41,15 @@ USER appuser
 EXPOSE 8080
 
 # Read-only filesystem (set in k8s securityContext too)
+#
+# HOME=/tmp because appuser is created with --no-create-home: gunicorn's control
+# server writes under $HOME at startup and logged a permission error on every
+# boot otherwise. /tmp is the one writable mount when the root filesystem is
+# read-only, so this works unchanged under the Kubernetes securityContext.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONHASHSEED=random \
+    HOME=/tmp \
     PORT=8080
 
 # Health check

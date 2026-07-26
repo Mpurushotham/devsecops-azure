@@ -1,0 +1,311 @@
+# =============================================================================
+# Lab — Terraform plan and apply
+# =============================================================================
+# Plan on PR (read-only, comments the diff), apply on merge behind a protected
+# GitHub Environment. The two use different federated credentials — a PR from a
+# fork can obtain the plan identity and never the apply identity, because the
+# OIDC subject claim differs (see lab/terraform/bootstrap).
+#
+# Every environment is planned on every PR: a change to a shared module that
+# breaks staging must not be discoverable only after production has merged.
+# =============================================================================
+
+name: Lab — Terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "lab/terraform/**"
+      - ".github/workflows/lab-terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "lab/terraform/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to apply"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+
+concurrency:
+  # Never cancel an in-flight apply: a half-applied plan leaves state and
+  # reality disagreeing, which is far worse than a queued run.
+  group: lab-terraform-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  security-events: write
+
+env:
+  TF_VERSION: "1.10.3"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # ── Static analysis, once for the whole tree ───────────────────────────────
+  validate:
+    name: Format, lint and scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff lab/terraform
+
+      - name: Install tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.54.0
+
+      - name: tflint (all modules and environments)
+        run: |
+          FAILED=0
+          for dir in lab/terraform/modules/*/ lab/terraform/envs/*/ lab/terraform/bootstrap/; do
+            echo "::group::tflint ${dir}"
+            (
+              cd "$dir"
+              tflint --init --config="${GITHUB_WORKSPACE}/.tflint.hcl" >/dev/null
+              tflint --config="${GITHUB_WORKSPACE}/.tflint.hcl" --format compact
+            ) || FAILED=1
+            echo "::endgroup::"
+          done
+          exit $FAILED
+
+      - name: terraform validate (all roots)
+        run: |
+          FAILED=0
+          for dir in lab/terraform/modules/*/ lab/terraform/envs/*/ lab/terraform/bootstrap/; do
+            echo "::group::validate ${dir}"
+            (cd "$dir" && terraform init -backend=false && terraform validate) || FAILED=1
+            echo "::endgroup::"
+          done
+          exit $FAILED
+
+      - name: Trivy IaC scan
+        uses: ./.github/actions/trivy-scan
+        with:
+          scan-type:  config
+          scan-ref:   lab/terraform
+          output:     trivy-iac.sarif
+          severity:   CRITICAL,HIGH
+          ignorefile: .trivyignore.yaml
+
+      # Shared gate. IaC findings carry no CVSS score, so the script falls
+      # back to the SARIF level — which is the correct signal for misconfig.
+      - name: Enforce CVSS thresholds (IaC)
+        run: |
+          python3 .github/scripts/cvss_gate.py trivy-iac.sarif --tool "Trivy IaC"
+
+      - name: Upload IaC SARIF
+        if: always() && hashFiles('trivy-iac.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-iac.sarif
+          category:   trivy-iac
+
+  # ── Plan every environment on every PR ─────────────────────────────────────
+  plan:
+    name: Plan (${{ matrix.environment }})
+    runs-on: ubuntu-24.04
+    needs: validate
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+    environment: ${{ matrix.environment }}-plan
+    defaults:
+      run:
+        working-directory: lab/terraform/envs/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.TF_AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform init
+        env:
+          ARM_USE_OIDC: "true"
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate-${{ matrix.environment }}" \
+            -backend-config="key=${{ matrix.environment }}.terraform.tfstate"
+
+      - name: terraform plan
+        id: plan
+        env:
+          ARM_USE_OIDC: "true"
+          TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id:       ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_pagerduty_webhook_url: ${{ secrets.PAGERDUTY_WEBHOOK_URL }}
+          TF_VAR_slack_webhook_url:     ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          terraform plan -no-color -out=tfplan -detailed-exitcode 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # A plan that destroys resources in production is the single highest-risk
+      # output of this pipeline — surface it as a first-class signal rather than
+      # something a reviewer has to spot in 500 lines of diff.
+      - name: Check for destructive changes
+        id: destructive
+        run: |
+          terraform show -json tfplan > plan.json
+          DESTROYS=$(python3 -c "
+          import json
+          plan = json.load(open('plan.json'))
+          n = sum(1 for rc in plan.get('resource_changes', [])
+                  if 'delete' in rc.get('change', {}).get('actions', []))
+          print(n)")
+
+          echo "count=${DESTROYS}" >> "$GITHUB_OUTPUT"
+          if [ "${DESTROYS}" -gt 0 ]; then
+            echo "::warning::This plan destroys ${DESTROYS} resource(s) in ${{ matrix.environment }}"
+          fi
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync(
+              'lab/terraform/envs/${{ matrix.environment }}/plan.txt', 'utf8');
+
+            // GitHub comments cap at 65536 chars; keep the tail, which holds
+            // the summary line reviewers actually look for.
+            const MAX = 60000;
+            if (plan.length > MAX) {
+              plan = '...(truncated)...\n' + plan.slice(-MAX);
+            }
+
+            const destroys = '${{ steps.destructive.outputs.count }}';
+            const warning = destroys !== '0'
+              ? `\n> **${destroys} resource(s) will be DESTROYED.** Review carefully.\n`
+              : '';
+
+            const body = [
+              `### Terraform plan — \`${{ matrix.environment }}\``,
+              warning,
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const marker = `### Terraform plan — \`${{ matrix.environment }}\``;
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith(marker));
+
+            // Update in place so a long PR does not accumulate one comment per push.
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::terraform plan failed for ${{ matrix.environment }}"
+          exit 1
+
+  # ── Apply on merge, behind a protected environment ─────────────────────────
+  apply:
+    name: Apply (${{ github.event.inputs.environment || 'dev' }})
+    runs-on: ubuntu-24.04
+    needs: validate
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: lab/terraform/envs/${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.TF_AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform init
+        env:
+          ARM_USE_OIDC: "true"
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate-${ENV}" \
+            -backend-config="key=${ENV}.terraform.tfstate"
+
+      # Plan and apply in the same job against the same commit: applying a plan
+      # generated from a different revision is how "the plan looked fine" turns
+      # into an unexpected change.
+      - name: terraform apply
+        env:
+          ARM_USE_OIDC: "true"
+          TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id:       ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_pagerduty_webhook_url: ${{ secrets.PAGERDUTY_WEBHOOK_URL }}
+          TF_VAR_slack_webhook_url:     ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+
+      - name: Publish outputs to the job summary
+        run: |
+          {
+            echo "### Terraform outputs — ${{ github.event.inputs.environment || 'dev' }}"
+            echo ""
+            echo '```'
+            # -json would include sensitive values; the human-readable form
+            # redacts them.
+            terraform output
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

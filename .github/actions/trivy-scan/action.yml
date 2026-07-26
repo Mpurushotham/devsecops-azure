@@ -1,0 +1,111 @@
+# =============================================================================
+# Composite action — Trivy scan
+# =============================================================================
+# Replaces aquasecurity/trivy-action, whose bundled installer failed on the
+# hosted runners ("found version: 0.65.0" then exit 1 before the binary was
+# usable), taking every SCA and image-scan job with it.
+#
+# Installing the pinned binary directly is both more reliable and one fewer
+# third-party action in the supply chain — the same reasoning already applied
+# to gitleaks and TruffleHog in security-gates.yml.
+#
+# The scan always exits 0; the caller applies the repo CVSS policy to the SARIF.
+# =============================================================================
+
+name: Trivy scan
+description: Install a pinned Trivy and scan a filesystem path, config tree or image.
+
+inputs:
+  scan-type:
+    description: 'fs | config | image'
+    required: true
+    default: fs
+  scan-ref:
+    description: Path or image reference to scan.
+    required: true
+  output:
+    description: SARIF output path.
+    required: true
+  severity:
+    description: Comma-separated severities to report.
+    required: false
+    default: CRITICAL,HIGH
+  ignore-unfixed:
+    description: Skip vulnerabilities with no available fix.
+    required: false
+    default: "true"
+  ignorefile:
+    description: Path to a .trivyignore.yaml, relative to the workspace.
+    required: false
+    default: ""
+  scanners:
+    description: Scanners to enable (vuln, secret, misconfig, license).
+    required: false
+    default: vuln
+  trivy-version:
+    description: Trivy version to install.
+    required: false
+    default: v0.58.1
+
+runs:
+  using: composite
+  steps:
+    - name: Install Trivy ${{ inputs.trivy-version }}
+      shell: bash
+      run: |
+        if command -v trivy >/dev/null 2>&1; then
+          echo "Trivy already present: $(trivy --version | head -1)"
+          exit 0
+        fi
+        curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+          | sudo sh -s -- -b /usr/local/bin "${{ inputs.trivy-version }}"
+        trivy --version
+
+    # The vulnerability database is ~700MB uncompressed and rate-limited on
+    # anonymous pulls; caching it keeps repeated PR runs fast and reliable.
+    - name: Cache Trivy DB
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.cache/trivy
+        key: trivy-db-${{ inputs.trivy-version }}-${{ github.run_id }}
+        restore-keys: |
+          trivy-db-${{ inputs.trivy-version }}-
+
+    - name: Run Trivy (${{ inputs.scan-type }})
+      shell: bash
+      env:
+        TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy
+      run: |
+        ARGS=(
+          "${{ inputs.scan-type }}"
+          "--format" "sarif"
+          "--output" "${{ inputs.output }}"
+          "--severity" "${{ inputs.severity }}"
+          # Always 0: the caller's CVSS gate decides pass/fail, so a scan and a
+          # policy violation are never conflated.
+          "--exit-code" "0"
+        )
+
+        # `trivy config` accepts neither --no-progress, --scanners nor
+        # --ignore-unfixed; passing them prints usage and exits non-zero.
+        if [ "${{ inputs.scan-type }}" != "config" ]; then
+          ARGS+=("--no-progress")
+          ARGS+=("--scanners" "${{ inputs.scanners }}")
+          [ "${{ inputs.ignore-unfixed }}" = "true" ] && ARGS+=("--ignore-unfixed")
+        fi
+
+        if [ -n "${{ inputs.ignorefile }}" ] && [ -f "${{ inputs.ignorefile }}" ]; then
+          ARGS+=("--ignorefile" "${{ inputs.ignorefile }}")
+        fi
+
+        ARGS+=("${{ inputs.scan-ref }}")
+
+        echo "trivy ${ARGS[*]}"
+        trivy "${ARGS[@]}"
+
+        # A missing report would make the downstream gate silently pass.
+        if [ ! -f "${{ inputs.output }}" ]; then
+          echo "::error::Trivy produced no SARIF at ${{ inputs.output }}"
+          exit 1
+        fi
+        echo "Wrote ${{ inputs.output }}"

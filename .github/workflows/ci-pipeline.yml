@@ -330,45 +330,20 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: ./.github/actions/trivy-scan
         with:
-          scan-type:     fs
-          scan-ref:      .
-          format:        sarif
-          output:        trivy-fs.sarif
-          severity:      CRITICAL,HIGH,MEDIUM
-          exit-code:     "0"   # We handle exit logic manually below
-          vuln-type:     library
-          ignore-unfixed: true
+          scan-type:      fs
+          scan-ref:       .
+          output:         trivy-fs.sarif
+          severity:       CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: "true"
 
+      # Shared gate: reads the real CVSS score from the SARIF rule properties.
+      # Trivy maps BOTH critical and high to level "error", so the old inline
+      # check blocked on HIGH findings that policy says should only warn.
       - name: Enforce CVSS thresholds (SCA)
         run: |
-          python3 - <<'PYEOF'
-          import json, sys
-
-          with open("trivy-fs.sarif") as f:
-              sarif = json.load(f)
-
-          critical_count = 0
-          high_count     = 0
-
-          for run in sarif.get("runs", []):
-              for result in run.get("results", []):
-                  level = result.get("level", "")
-                  # SARIF: error=CRITICAL, warning=HIGH, note=MEDIUM/LOW
-                  if level == "error":
-                      critical_count += 1
-                  elif level == "warning":
-                      high_count += 1
-
-          print(f"SCA results — CRITICAL (CVSS>9): {critical_count}, HIGH (CVSS 7-8.9): {high_count}")
-
-          if critical_count > 0:
-              print("::error::CRITICAL vulnerabilities found in dependencies — build blocked (CVSS > 9.0)")
-              sys.exit(1)
-          elif high_count > 0:
-              print(f"::warning::HIGH vulnerabilities found ({high_count}) — creating tracking ticket")
-          PYEOF
+          python3 .github/scripts/cvss_gate.py trivy-fs.sarif --tool "Trivy SCA"
 
       - name: Upload Trivy SCA SARIF
         if: always()
@@ -475,40 +450,19 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: ./.github/actions/trivy-scan
         with:
-          image-ref:  ${{ env.FULL_IMAGE }}
-          format:     sarif
-          output:     trivy-image.sarif
-          severity:   CRITICAL,HIGH
-          exit-code:  "0"
+          scan-type: image
+          scan-ref:  ${{ env.FULL_IMAGE }}
+          output:    trivy-image.sarif
+          severity:  CRITICAL,HIGH
 
+      # Shared gate: reads the real CVSS score from the SARIF rule properties.
+      # Trivy maps BOTH critical and high to level "error", so the old inline
+      # check blocked on HIGH findings that policy says should only warn.
       - name: Enforce CVSS thresholds (Image)
         run: |
-          python3 - <<'PYEOF'
-          import json, sys
-
-          with open("trivy-image.sarif") as f:
-              sarif = json.load(f)
-
-          critical_count = sum(
-              1 for run in sarif.get("runs", [])
-              for result in run.get("results", [])
-              if result.get("level") == "error"
-          )
-          high_count = sum(
-              1 for run in sarif.get("runs", [])
-              for result in run.get("results", [])
-              if result.get("level") == "warning"
-          )
-
-          print(f"Image scan — CRITICAL: {critical_count}, HIGH: {high_count}")
-          if critical_count > 0:
-              print("::error::CRITICAL CVEs in container image — build blocked")
-              sys.exit(1)
-          elif high_count > 0:
-              print(f"::warning::{high_count} HIGH CVEs found — ticket will be created")
-          PYEOF
+          python3 .github/scripts/cvss_gate.py trivy-image.sarif --tool "Trivy image"
 
       - name: Grype image scan
         run: |

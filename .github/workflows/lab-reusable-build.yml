@@ -1,0 +1,206 @@
+# =============================================================================
+# Reusable workflow — container build, scan, sign and SBOM
+# =============================================================================
+# One implementation of "how this organisation builds a container", called by
+# every service. A service pipeline becomes ~15 lines, and a change to the
+# supply-chain requirements (a new scanner, a stricter threshold) ships to every
+# service by editing this file rather than N copies.
+#
+# Authentication is OIDC throughout: no ACR password, no service principal
+# secret. The caller must grant `id-token: write`.
+#
+# Usage:
+#   jobs:
+#     build:
+#       uses: ./.github/workflows/lab-reusable-build.yml
+#       with:
+#         service-name: payments-api
+#         context: lab/apps/payments-api
+#       secrets: inherit
+# =============================================================================
+
+name: Reusable — Build & Sign
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Service name; also the ACR repository name."
+        required: true
+        type: string
+      context:
+        description: "Docker build context, relative to the repo root."
+        required: true
+        type: string
+      dockerfile:
+        description: "Dockerfile path. Defaults to <context>/Dockerfile."
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Push the image. False on PRs — build and scan only."
+        required: false
+        type: boolean
+        default: true
+      platforms:
+        description: "Target platforms."
+        required: false
+        type: string
+        default: linux/amd64
+      severity-gate:
+        description: "Fail the build at this severity or above."
+        required: false
+        type: string
+        default: CRITICAL
+    outputs:
+      image-digest:
+        description: "Digest of the built image — the immutable deploy reference."
+        value: ${{ jobs.build.outputs.digest }}
+      image-ref:
+        description: "Full digest-pinned image reference."
+        value: ${{ jobs.build.outputs.image-ref }}
+
+permissions:
+  contents: read
+  id-token: write        # OIDC for Azure login and keyless signing
+  security-events: write # SARIF upload
+  packages: write
+
+jobs:
+  build:
+    name: Build, scan and sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build-push.outputs.digest }}
+      image-ref: ${{ steps.ref.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Azure login (OIDC — no stored credential)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # `az acr login` mints a short-lived token from the OIDC session, so no
+      # registry password exists to leak or rotate.
+      - name: ACR login
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.ACR_REGISTRY }}/${{ inputs.service-name }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          context:    ${{ inputs.context }}
+          file:       ${{ inputs.dockerfile != '' && inputs.dockerfile || format('{0}/Dockerfile', inputs.context) }}
+          platforms:  ${{ inputs.platforms }}
+          push:       ${{ inputs.push }}
+          load:       ${{ !inputs.push }}
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ inputs.service-name }}
+          cache-to:   type=gha,mode=max,scope=${{ inputs.service-name }}
+          sbom:       true
+          provenance: mode=max
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      - name: Resolve image reference
+        id: ref
+        run: |
+          if [ "${{ inputs.push }}" = "true" ]; then
+            REF="${{ vars.ACR_REGISTRY }}/${{ inputs.service-name }}@${{ steps.build-push.outputs.digest }}"
+          else
+            # Not pushed, so scan the local tag instead of a digest.
+            REF=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          fi
+          echo "image_ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "Image reference: ${REF}"
+
+      - name: Trivy image scan
+        uses: ./.github/actions/trivy-scan
+        with:
+          # The composite action always exits 0; the gate below owns pass/fail
+          # so we can apply the repo CVSS policy.
+          scan-type:      image
+          scan-ref:       ${{ steps.ref.outputs.image_ref }}
+          output:         trivy-image.sarif
+          severity:       CRITICAL,HIGH
+          ignore-unfixed: "true"
+
+      # Shared gate: reads the real CVSS score from the SARIF rule properties.
+      # Trivy maps BOTH critical and high to level "error", so the old inline
+      # check blocked on HIGH findings that policy says should only warn.
+      - name: Enforce CVSS thresholds
+        id: gate
+        run: |
+          python3 .github/scripts/cvss_gate.py trivy-image.sarif \
+            --tool "${{ inputs.service-name }} image" \
+            ${{ inputs.severity-gate == 'HIGH' && '--fail-on-high' || '' }}
+
+      - name: Upload Trivy SARIF
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category:   trivy-${{ inputs.service-name }}
+
+      # Signing only makes sense for an image that exists in the registry.
+      - name: Install cosign
+        if: inputs.push
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign image (keyless, Sigstore transparency log)
+        if: inputs.push
+        run: |
+          cosign sign --yes \
+            --rekor-url https://rekor.sigstore.dev \
+            "${{ steps.ref.outputs.image_ref }}"
+
+      - name: Generate and attest SBOM
+        if: inputs.push
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+            sudo sh -s -- -b /usr/local/bin v1.18.1
+
+          syft "${{ steps.ref.outputs.image_ref }}" \
+            -o cyclonedx-json="sbom-${{ inputs.service-name }}.json"
+
+          # The attestation binds the SBOM to the digest in the transparency
+          # log, so "what is in this image" is answerable after the fact.
+          cosign attest --yes \
+            --predicate "sbom-${{ inputs.service-name }}.json" \
+            --type cyclonedx \
+            "${{ steps.ref.outputs.image_ref }}"
+
+      - name: Upload SBOM artifact
+        if: inputs.push
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ inputs.service-name }}-${{ github.sha }}
+          path: sbom-${{ inputs.service-name }}.json
+          retention-days: 90

@@ -370,23 +370,24 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Trivy scan — full (OS + library)
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: ./.github/actions/trivy-scan
         with:
-          image-ref:  ${{ env.IMAGE_REF }}
-          format:     sarif
-          output:     trivy-release.sarif
-          severity:   CRITICAL,HIGH,MEDIUM,LOW
-          exit-code:  "0"
-          vuln-type:  os,library
+          scan-type:      image
+          scan-ref:       ${{ env.IMAGE_REF }}
+          output:         trivy-release.sarif
+          severity:       CRITICAL,HIGH,MEDIUM,LOW
+          ignore-unfixed: "false"
 
-      - name: Trivy scan — JSON (for artifact)
-        uses: aquasecurity/trivy-action@v0.33.1
-        with:
-          image-ref: ${{ env.IMAGE_REF }}
-          format:    json
-          output:    trivy-release.json
-          severity:  CRITICAL,HIGH,MEDIUM,LOW
-          exit-code: "0"
+      # JSON for the release artifact. The composite action emits SARIF only,
+      # and Trivy is already installed by the step above.
+      - name: Trivy scan — JSON (for the release artifact)
+        run: |
+          trivy image "${{ env.IMAGE_REF }}" \
+            --format json \
+            --output trivy-release.json \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            --no-progress
 
       - name: Enforce CVSS thresholds (final gate)
         run: |

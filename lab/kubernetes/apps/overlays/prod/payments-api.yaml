@@ -1,0 +1,126 @@
+# =============================================================================
+# payments-api — production Application
+# =============================================================================
+# The image digest below is the only line the CD pipeline edits. It opens a PR
+# rather than pushing, so every production deployment is a reviewed, revertible
+# commit — `git revert` is the rollback procedure (docs/RUNBOOKS.md).
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: payments-api-prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  annotations:
+    # Sync waves: platform components (wave -1) must exist before workloads.
+    argocd.argoproj.io/sync-wave: "0"
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: platform-alerts
+    notifications.argoproj.io/subscribe.on-health-degraded.slack: platform-alerts
+spec:
+  project: payments
+
+  source:
+    repoURL: https://github.com/Mpurushotham/devsecops-azure.git
+    targetRevision: main
+    path: lab/charts/dotnet-service
+
+    helm:
+      releaseName: payments-api
+
+      valuesObject:
+        image:
+          repository: acrrebtelplatprod.azurecr.io/payments-api
+          # Digest, not a tag: Kyverno rejects mutable tags in production, and
+          # a digest guarantees the running image is the one that was scanned
+          # and signed. Updated by the CD pipeline.
+          digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+        replicaCount: 5
+
+        serviceAccount:
+          create: true
+          name: payments-api
+          # From the platform_identity module output. The federated credential
+          # is pinned to system:serviceaccount:payments:payments-api.
+          workloadIdentityClientId: "REPLACED_BY_TERRAFORM_OUTPUT"
+
+        autoscaling:
+          enabled: true
+          minReplicas: 5
+          maxReplicas: 40
+          targetCPUUtilizationPercentage: 65
+
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            memory: 1Gi
+
+        podDisruptionBudget:
+          enabled: true
+          minAvailable: 66%
+
+        ingress:
+          enabled: true
+          className: nginx
+          host: payments.example.com
+          tls:
+            enabled: true
+
+        keyVault:
+          enabled: true
+          name: kv-rebtel-plat-prod
+          tenantId: "REPLACED_BY_TERRAFORM_OUTPUT"
+          secrets:
+            - objectName: payments-processor-api-key
+              objectType: secret
+              envVar: PAYMENT_PROCESSOR_KEY
+
+        env:
+          ASPNETCORE_ENVIRONMENT: Production
+          ENVIRONMENT: prod
+          OTEL_SERVICE_NAME: payments-api
+          OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4317
+          # Must stay below terminationGracePeriodSeconds.
+          SHUTDOWN_DRAIN_SECONDS: "10"
+
+        # ConnectionStrings__Default carries no password — authentication is the
+        # pod's workload identity (Authentication=Active Directory Default).
+        configMap:
+          enabled: true
+          data:
+            ConnectionStrings__Default: >-
+              Server=tcp:sql-rebtel-plat-prod.database.windows.net,1433;
+              Database=payments;
+              Authentication=Active Directory Default;
+              Encrypt=True;TrustServerCertificate=False;
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: payments
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false # namespace is platform-owned, created in wave -1
+      - PruneLast=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+  # Two revisions is enough to diagnose "what changed"; more is state nobody
+  # reads and ArgoCD keeps it in its own database.
+  revisionHistoryLimit: 5

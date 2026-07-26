@@ -391,47 +391,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.33.1
+        uses: ./.github/actions/trivy-scan
         with:
           scan-type:      fs
           scan-ref:       .
-          format:         sarif
           output:         trivy-fs-pr.sarif
           severity:       CRITICAL,HIGH,MEDIUM
-          exit-code:      "0"
-          vuln-type:      library,os
-          ignore-unfixed: true
-          list-all-pkgs: true
+          ignore-unfixed: "true"
 
+      # Shared gate: reads the real CVSS score from the SARIF rule properties.
+      # Trivy maps BOTH critical and high to level "error", so the old inline
+      # check blocked on HIGH findings that policy says should only warn.
       - name: Enforce CVSS thresholds (SCA — Trivy)
+        id: sca-gate
         run: |
-          python3 - <<'PYEOF'
-          import json, sys, os
-
-          path = "trivy-fs-pr.sarif"
-          if not os.path.exists(path):
-              print("No Trivy SARIF — skipping.")
-              sys.exit(0)
-
-          with open(path) as f:
-              sarif = json.load(f)
-
-          critical, high = 0, 0
-          for run in sarif.get("runs", []):
-              for result in run.get("results", []):
-                  level = result.get("level", "")
-                  if level == "error":
-                      critical += 1
-                  elif level == "warning":
-                      high += 1
-
-          print(f"Trivy SCA — CRITICAL: {critical}, HIGH: {high}")
-          if critical > 0:
-              print(f"::error::Trivy found {critical} CRITICAL CVEs in dependencies (CVSS > 9.0) — blocking PR")
-              sys.exit(1)
-          elif high > 0:
-              print(f"::warning::Trivy found {high} HIGH CVEs (CVSS 7.0-8.9) — ticket will be filed")
-          PYEOF
+          python3 .github/scripts/cvss_gate.py trivy-fs-pr.sarif \
+            --tool "Trivy SCA" \
+            --critical "${CVSS_CRITICAL_THRESHOLD}" \
+            --high "${CVSS_HIGH_THRESHOLD}" \
+            --json-out sca-findings.json
 
       - name: Upload Trivy SCA SARIF
         if: always() && hashFiles('trivy-fs-pr.sarif') != ''

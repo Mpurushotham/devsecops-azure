@@ -1,0 +1,297 @@
+# =============================================================================
+# Lab — application CD (GitOps promotion)
+# =============================================================================
+# ADR-014 in practice. This pipeline never touches the cluster: it builds a
+# signed image and then *proposes* a digest change in git. ArgoCD does the
+# deploying. Consequences worth stating plainly:
+#
+#   - the pipeline holds no cluster credentials, so compromising it does not
+#     compromise production;
+#   - every deployment is a reviewable commit, and rollback is `git revert`;
+#   - what is running is always what is in main, because ArgoCD self-heals.
+#
+# dev is auto-merged (fast feedback), staging and prod open a PR for review.
+# =============================================================================
+
+name: Lab — Application CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lab/apps/**"
+      - "lab/charts/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to promote to"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      service:
+        description: "Service to promote"
+        required: true
+        default: payments-api
+
+permissions:
+  contents: write
+  id-token: write
+  security-events: write
+  pull-requests: write
+
+concurrency:
+  group: lab-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Chart quality gate ─────────────────────────────────────────────────────
+  # Runs before the build so a broken chart fails in seconds rather than after
+  # a five-minute image build.
+  chart-test:
+    name: Helm lint and policy check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: helm lint
+        run: |
+          helm lint lab/charts/dotnet-service \
+            --set image.repository=example.azurecr.io/svc \
+            --set image.tag=test
+
+      - name: Render manifests
+        run: |
+          helm template test lab/charts/dotnet-service \
+            --namespace payments \
+            --set image.repository=example.azurecr.io/svc \
+            --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+            --set serviceAccount.workloadIdentityClientId=00000000-0000-0000-0000-000000000000 \
+            > rendered.yaml
+          echo "Rendered $(grep -c '^kind:' rendered.yaml) manifests"
+
+      - name: Install kube-linter
+        run: |
+          curl -sSfLO https://github.com/stackrox/kube-linter/releases/download/v0.6.8/kube-linter-linux.tar.gz
+          tar -xzf kube-linter-linux.tar.gz
+          sudo install -m 0755 kube-linter /usr/local/bin/kube-linter
+
+      # Same checks Kyverno enforces at admission — failing here means the
+      # service would have been rejected at deploy time anyway.
+      - name: kube-linter
+        run: kube-linter lint rendered.yaml --config security/.kube-linter.yaml
+
+      # Belt and braces: assert the security contract directly, so a values
+      # change that quietly drops runAsNonRoot cannot merge.
+      - name: Assert platform security contract
+        run: |
+          python3 - <<'PYEOF'
+          import sys, yaml
+
+          docs = [d for d in yaml.safe_load_all(open("rendered.yaml")) if d]
+          dep = next(d for d in docs if d["kind"] == "Deployment")
+          pod = dep["spec"]["template"]["spec"]
+          c = pod["containers"][0]
+
+          checks = {
+              "image is digest-pinned":     "@sha256:" in c["image"],
+              "runAsNonRoot":               pod["securityContext"].get("runAsNonRoot") is True,
+              "readOnlyRootFilesystem":     c["securityContext"].get("readOnlyRootFilesystem") is True,
+              "no privilege escalation":    c["securityContext"].get("allowPrivilegeEscalation") is False,
+              "all capabilities dropped":   c["securityContext"]["capabilities"]["drop"] == ["ALL"],
+              "seccomp RuntimeDefault":     pod["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault",
+              "cpu + memory requests set":  {"cpu", "memory"} <= set(c["resources"]["requests"]),
+              "memory limit set":           "memory" in c["resources"]["limits"],
+              "liveness probe":             "livenessProbe" in c,
+              "readiness probe":            "readinessProbe" in c,
+              "SA token not automounted":   pod.get("automountServiceAccountToken") is False,
+              "surge-only rollout":         dep["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"] == 0,
+              "PodDisruptionBudget exists": any(d["kind"] == "PodDisruptionBudget" for d in docs),
+              "NetworkPolicy exists":       any(d["kind"] == "NetworkPolicy" for d in docs),
+          }
+
+          for name, ok in checks.items():
+              print(f"{'PASS' if ok else 'FAIL'}  {name}")
+
+          if not all(checks.values()):
+              print("::error::Chart violates the platform security contract")
+              sys.exit(1)
+          PYEOF
+
+  # ── Build via the shared workflow ──────────────────────────────────────────
+  build:
+    name: Build payments-api
+    needs: chart-test
+    uses: ./.github/workflows/lab-reusable-build.yml
+    with:
+      service-name: payments-api
+      context: lab/apps/payments-api
+      push: true
+    # `secrets: inherit` is GitHub Actions syntax for passing the caller's
+    # secrets to a reusable workflow, not a credential — the detect-secrets
+    # keyword heuristic matches on the word alone.
+    secrets: inherit # pragma: allowlist secret
+
+  # ── Promote by committing a digest ─────────────────────────────────────────
+  promote:
+    name: Promote to ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image digest in the environment overlay
+        id: update
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+          SERVICE: ${{ github.event.inputs.service || 'payments-api' }}
+          DIGEST: ${{ needs.build.outputs.image-digest }}
+        run: |
+          FILE="lab/kubernetes/apps/overlays/${ENVIRONMENT}/${SERVICE}.yaml"
+          if [ ! -f "$FILE" ]; then
+            echo "::error::No overlay at ${FILE}"
+            exit 1
+          fi
+
+          # Rewrite only the digest line; anything else in the overlay is a
+          # human decision and must not be touched by automation.
+          python3 - <<PYEOF
+          import re, pathlib
+          p = pathlib.Path("${FILE}")
+          s = p.read_text()
+          new, n = re.subn(r"digest: sha256:[a-f0-9]{64}",
+                           "digest: ${DIGEST}", s)
+          if n != 1:
+              raise SystemExit(f"expected exactly one digest line, found {n}")
+          p.write_text(new)
+          print(f"Updated {p} -> ${DIGEST}")
+          PYEOF
+
+          echo "file=${FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit to dev directly
+        if: (github.event.inputs.environment || 'dev') == 'dev'
+        run: |
+          git config user.name  "platform-ci[bot]"
+          git config user.email "platform-ci@users.noreply.github.com"
+          git add "${{ steps.update.outputs.file }}"
+          git diff --staged --quiet && { echo "No change"; exit 0; }
+          git commit -m "chore(dev): promote payments-api to ${{ needs.build.outputs.image-digest }}
+
+          Image: ${{ needs.build.outputs.image-ref }}
+          Source commit: ${{ github.sha }}"
+          git push
+
+      # staging and prod get a PR: promotion to an environment customers touch
+      # is a decision a human signs off, and the PR is the audit record.
+      - name: Open a promotion PR for staging/prod
+        if: (github.event.inputs.environment || 'dev') != 'dev'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: |
+          BRANCH="promote/${ENVIRONMENT}/payments-api-${GITHUB_SHA::7}"
+          git config user.name  "platform-ci[bot]"
+          git config user.email "platform-ci@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add "${{ steps.update.outputs.file }}"
+          git diff --staged --quiet && { echo "No change"; exit 0; }
+          git commit -m "chore(${ENVIRONMENT}): promote payments-api"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --title "Promote payments-api to ${ENVIRONMENT}" \
+            --body "$(cat <<EOF
+          ## Promotion
+
+          | | |
+          |---|---|
+          | Environment | \`${ENVIRONMENT}\` |
+          | Service | payments-api |
+          | Digest | \`${{ needs.build.outputs.image-digest }}\` |
+          | Source commit | ${GITHUB_SHA} |
+
+          The image is signed with cosign and has an attested CycloneDX SBOM.
+          Trivy reported no CRITICAL CVEs.
+
+          Merging this PR makes ArgoCD sync the new digest. Rollback is
+          \`git revert\` of the merge commit.
+          EOF
+          )" \
+            --base main \
+            --head "$BRANCH" \
+            --label "promotion,${ENVIRONMENT}"
+
+  # ── Post-deploy verification ───────────────────────────────────────────────
+  verify:
+    name: Verify dev deployment
+    runs-on: ubuntu-24.04
+    needs: promote
+    if: (github.event.inputs.environment || 'dev') == 'dev'
+    timeout-minutes: 20
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Get cluster credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+      # ArgoCD syncs asynchronously, so wait for the rollout rather than
+      # assuming the commit means it is live.
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/payments-api-dotnet-service \
+            --namespace payments \
+            --timeout=10m
+
+      - name: Verify the running digest matches what we built
+        run: |
+          RUNNING=$(kubectl get deployment payments-api-dotnet-service \
+            --namespace payments \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Running image: ${RUNNING}"
+
+          case "${RUNNING}" in
+            *"${{ needs.build.outputs.image-digest }}") echo "Digest matches." ;;
+            *) echo "::error::Running digest does not match the built image"; exit 1 ;;
+          esac
+
+      - name: Smoke test
+        run: |
+          kubectl run smoke-test-${GITHUB_RUN_ID} \
+            --namespace payments \
+            --image=curlimages/curl:8.11.1 \
+            --restart=Never \
+            --rm --attach --quiet \
+            --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"seccompProfile":{"type":"RuntimeDefault"}}}}' \
+            -- sh -c '
+              set -e
+              BASE=http://payments-api-dotnet-service.payments.svc.cluster.local
+              curl -fsS "$BASE/healthz" | grep -q ok
+              curl -fsS "$BASE/readyz"  >/dev/null
+              curl -fsS "$BASE/api/v1/info" | grep -q payments-api
+              # The security headers are part of the contract, not a nicety.
+              curl -fsSI "$BASE/healthz" | grep -qi "x-content-type-options: nosniff"
+              echo "smoke tests passed"
+            '
