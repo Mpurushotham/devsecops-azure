@@ -122,8 +122,10 @@ jobs:
           labels:     ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ inputs.service-name }}
           cache-to:   type=gha,mode=max,scope=${{ inputs.service-name }}
-          sbom:       true
-          provenance: mode=max
+          # Attestations create a manifest list the local docker exporter cannot
+          # load, so they are attached only when the image is actually pushed.
+          sbom:       ${{ inputs.push }}
+          provenance: ${{ inputs.push && 'mode=max' || 'false' }}
           build-args: |
             VERSION=${{ github.ref_name }}
             GIT_COMMIT=${{ github.sha }}

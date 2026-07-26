@@ -453,8 +453,12 @@ jobs:
           labels:     ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to:   type=gha,mode=max
-          sbom:       true
-          provenance: mode=max
+          # Attestations produce a manifest list, which the local docker
+          # exporter cannot load ("docker exporter does not currently support
+          # exporting manifest lists"). They are only meaningful for an image
+          # that reaches a registry anyway, so attach them when pushing.
+          sbom:       ${{ github.event_name != 'pull_request' && steps.registry.outputs.enabled == 'true' }}
+          provenance: ${{ (github.event_name != 'pull_request' && steps.registry.outputs.enabled == 'true') && 'mode=max' || 'false' }}
           build-args: |
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
             GIT_COMMIT=${{ github.sha }}
