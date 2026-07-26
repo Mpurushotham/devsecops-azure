@@ -142,7 +142,7 @@ devsecops/
 
 ```bash
 # Install all security tools
-./devsecops/scripts/install-security-tools.sh
+./scripts/install-security-tools.sh
 
 # Verify tools
 trivy --version && cosign version && syft --version && semgrep --version
@@ -156,45 +156,68 @@ az login
 export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
 # Provision AKS + security resources + monitoring
-cd devsecops/infrastructure/terraform/aks
+cd infrastructure/terraform/aks
 terraform init && terraform apply -var="environment=staging"
 
 # Bootstrap cluster
-./devsecops/scripts/setup-aks.sh staging
+./scripts/setup-aks.sh staging
 ```
 
-### 2 · Configure GitHub Secrets
+### 2 · Configure GitHub Secrets and Variables
+
+The workflows read credentials from **secrets** (`secrets.*`) and non-sensitive
+configuration from **repository variables** (`vars.*`). Setting a variable as a
+secret — or the reverse — silently yields an empty value at runtime.
+
+**Secrets** (`Settings → Secrets and variables → Actions → Secrets`):
 
 | Secret | Description |
 |--------|-------------|
-| `AZURE_CREDENTIALS` | Azure service principal JSON |
-| `ACR_REGISTRY` | ACR login server (e.g. `myacr.azurecr.io`) |
+| `AZURE_CREDENTIALS` | Azure service principal JSON (used by `azure/login`) |
+| `AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
 | `ACR_USERNAME` | ACR username |
 | `ACR_PASSWORD` | ACR password |
-| `SONAR_TOKEN` | SonarQube/SonarCloud token |
-| `SNYK_TOKEN` | Snyk API token |
-| `SEMGREP_APP_TOKEN` | Semgrep App token |
-| `ARGOCD_SERVER` | ArgoCD server URL |
-| `ARGOCD_TOKEN` | ArgoCD API token |
+| `SONAR_TOKEN` | SonarQube/SonarCloud token — scan is skipped when unset |
+| `SNYK_TOKEN` | Snyk API token — scan is skipped when unset |
+| `SEMGREP_APP_TOKEN` | Semgrep App token (optional; OSS rules run without it) |
+| `FOSSA_API_KEY` | FOSSA token — falls back to `pip-licenses` when unset |
+| `ARGOCD_AUTH_TOKEN` | ArgoCD API token (staging) |
+| `ARGOCD_PROD_AUTH_TOKEN` | ArgoCD API token (production) |
+| `AZURE_MONITOR_WEBHOOK_URL` | Deploy notification webhook |
 | `SLACK_WEBHOOK_URL` | Slack webhook for notifications |
-| `AZURE_RG` | AKS resource group name |
-| `AKS_CLUSTER_NAME` | AKS cluster name |
-| `AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
+
+**Variables** (`Settings → Secrets and variables → Actions → Variables`):
+
+| Variable | Description |
+|----------|-------------|
+| `ACR_REGISTRY` | ACR login server (e.g. `myacr.azurecr.io`) |
+| `ACR_PROD_REGISTRY` | Production ACR login server |
+| `ACR_REPOSITORY` | Image repository name (e.g. `devsecops-app`) |
+| `SONAR_HOST_URL` | SonarQube server URL |
+| `ARGOCD_SERVER` / `ARGOCD_PROD_SERVER` | ArgoCD server hostnames |
+| `AKS_RESOURCE_GROUP` / `AKS_CLUSTER_NAME` | Staging AKS target |
+| `AKS_PROD_RESOURCE_GROUP` / `AKS_PROD_CLUSTER_NAME` | Production AKS target |
+| `STAGING_URL` / `PRODUCTION_URL` / `PRODUCTION_GREEN_URL` | Smoke-test endpoints |
+| `DAST_RESOURCE_GROUP` | Resource group for the ephemeral DAST environment |
+
+Scanners that depend on a third-party service (SonarQube, Snyk, FOSSA) and the
+nightly DAST environment **skip with a notice** when their credentials are
+absent, so a fork without those accounts still gets a green, meaningful gate.
 
 ### 3 · Run Security Scans Locally
 
 ```bash
 # SAST scan
-semgrep --config=devsecops/security/semgrep/.semgrep.yml .
+semgrep --config=security/semgrep/.semgrep.yml .
 
 # Secret detection
-gitleaks detect --config=devsecops/security/.gitleaks.toml
+gitleaks detect --config=security/.gitleaks.toml
 
 # Container image scan
-trivy image --config=devsecops/security/trivy/trivy-config.yaml myacr.azurecr.io/devsecops-app:latest
+trivy image --config=security/trivy/trivy-config.yaml myacr.azurecr.io/devsecops-app:latest
 
 # SBOM generation + signing
-./devsecops/scripts/generate-sbom.sh myacr.azurecr.io/devsecops-app:latest
+./scripts/generate-sbom.sh myacr.azurecr.io/devsecops-app:latest
 
 # Verify image signature
 cosign verify \

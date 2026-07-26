@@ -38,9 +38,9 @@ env:
   ACR_REPOSITORY:      ${{ vars.ACR_REPOSITORY }}        # e.g. myapp
   IMAGE_TAG:           ${{ github.sha }}
   SONAR_HOST_URL:      ${{ vars.SONAR_HOST_URL }}
-  JAVA_VERSION:        "21"
-  NODE_VERSION:        "20"
   PYTHON_VERSION:      "3.12"
+  APP_DIR:             "app"                             # Build context + source root
+  HEALTH_PATH:         "/healthz"                        # Flask liveness probe
   SLSA_GENERATOR_REF: "v2.0.0"
 
 # ── Permissions (least-privilege per job where possible) ───────────────────
@@ -66,39 +66,29 @@ jobs:
         with:
           fetch-depth: 0          # Full history for SonarQube blame data
 
-      - name: Set up Node ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: ${{ env.APP_DIR }}/requirements.txt
 
       - name: Install lint dependencies
+        run: pip install --quiet flake8 black isort
+
+      - name: Run flake8 (syntax + undefined names are hard errors)
         run: |
-          npm ci --prefer-offline
-          pip install --quiet flake8 black isort
+          flake8 "${APP_DIR}" --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Run ESLint
-        run: npx eslint . --max-warnings 0 --format @microsoft/eslint-formatter-sarif \
-               --output-file eslint-results.sarif || true
+      - name: Run flake8 (full style report — advisory)
+        run: |
+          flake8 "${APP_DIR}" --count --max-line-length=120 --statistics --exit-zero
 
-      - name: Run flake8 (Python)
-        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+      - name: Run black (format check)
+        run: black --check --diff "${APP_DIR}"
 
-      - name: Run black (Python format check)
-        run: black --check .
-
-      - name: Upload ESLint SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: eslint-results.sarif
-          category:   eslint
+      - name: Run isort (import order check)
+        run: isort --check-only --diff "${APP_DIR}"
 
 # =============================================================================
 # JOB 2 — Build (reproducible, pinned)
@@ -115,12 +105,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up JDK ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.APP_DIR }}/requirements.txt
 
       - name: Set build version
         id: set-version
@@ -128,18 +118,23 @@ jobs:
           VERSION="${{ github.ref_name }}-${{ github.sha }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Build (Maven — reproducible)
+      - name: Build wheel (reproducible — SOURCE_DATE_EPOCH pinned to the commit)
         run: |
-          mvn --batch-mode --no-transfer-progress \
-              -Dartifact.buildinfo.attach=true \
-              -Dproject.build.outputTimestamp=$(git log -1 --format=%cI) \
-              clean package -DskipTests
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          echo "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+
+          pip install --quiet build
+          # Dependencies are fully pinned in requirements.txt, so resolving them
+          # here proves the lockset installs cleanly before we build an image.
+          pip install --quiet --require-hashes=false -r "${APP_DIR}/requirements.txt"
+          python -m build --wheel --outdir dist/ "${APP_DIR}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-artifacts-${{ github.sha }}
-          path: target/*.jar
+          path: dist/*.whl
           retention-days: 7
           if-no-files-found: error
 
@@ -151,40 +146,44 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: testpassword
-          POSTGRES_DB:       testdb
-        options: >-
-          --health-cmd "pg_isready"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v4
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.APP_DIR }}/requirements.txt
 
-      - name: Run tests with coverage
+      - name: Install runtime + test dependencies
+        working-directory: ${{ env.APP_DIR }}
         run: |
-          mvn --batch-mode --no-transfer-progress \
-              -Dspring.datasource.url=jdbc:postgresql://localhost:5432/testdb \
-              -Dspring.datasource.password=testpassword \
-              test jacoco:report
+          pip install --quiet -r requirements.txt
+          pip install --quiet pytest pytest-cov
 
-      - name: Upload JaCoCo coverage report
+      # Tests import `from src.main import app`, so pytest must run with app/ as
+      # the rootdir — hence working-directory rather than a repo-root invocation.
+      - name: Run unit tests with coverage
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --junitxml=junit.xml \
+            -v
+
+      - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jacoco-report-${{ github.sha }}
-          path: target/site/jacoco/
+          name: coverage-report-${{ github.sha }}
+          path: |
+            ${{ env.APP_DIR }}/coverage.xml
+            ${{ env.APP_DIR }}/junit.xml
           retention-days: 7
 
 # =============================================================================
@@ -200,27 +199,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-
       - name: Download coverage report
         uses: actions/download-artifact@v4
         with:
-          name: jacoco-report-${{ github.sha }}
-          path: target/site/jacoco/
+          name: coverage-report-${{ github.sha }}
+          path: ${{ env.APP_DIR }}/
 
-      - name: SonarQube Scan
+      # SonarQube is optional infrastructure — without a token the scanner
+      # cannot authenticate, so skip rather than fail the pipeline.
+      - name: Check SonarQube configuration
+        id: sonar-config
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          mvn --batch-mode --no-transfer-progress sonar:sonar \
-              -Dsonar.host.url=${{ env.SONAR_HOST_URL }} \
-              -Dsonar.token=$SONAR_TOKEN \
-              -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-              -Dsonar.qualitygate.wait=true
+          if [ -n "${SONAR_TOKEN}" ] && [ -n "${SONAR_HOST_URL}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SONAR_TOKEN/SONAR_HOST_URL not configured — skipping SonarQube scan."
+          fi
+
+      - name: SonarQube Scan (Python)
+        if: steps.sonar-config.outputs.enabled == 'true'
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=devsecops-azure
+            -Dsonar.sources=${{ env.APP_DIR }}/src
+            -Dsonar.tests=${{ env.APP_DIR }}/tests
+            -Dsonar.python.coverage.reportPaths=${{ env.APP_DIR }}/coverage.xml
+            -Dsonar.python.version=3.12
+            -Dsonar.qualitygate.wait=true
 
 # =============================================================================
 # JOB 5 — SAST: Semgrep
@@ -272,7 +284,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type:     fs
           scan-ref:      .
@@ -319,19 +331,22 @@ jobs:
           sarif_file: trivy-fs.sarif
           category:   trivy-sca
 
-      - name: Snyk SCA scan
-        uses: snyk/actions/maven@master
+      - name: Snyk SCA scan (Python)
+        if: env.SNYK_ENABLED == 'true'
+        uses: snyk/actions/python-3.10@master
         continue-on-error: true
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_TOKEN:   ${{ secrets.SNYK_TOKEN }}
+          SNYK_ENABLED: ${{ secrets.SNYK_TOKEN != '' }}
         with:
           args: >
             --severity-threshold=high
             --sarif-file-output=snyk.sarif
-            --all-projects
+            --file=app/requirements.txt
+            --package-manager=pip
 
       - name: Upload Snyk SARIF
-        if: always()
+        if: always() && hashFiles('snyk.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: snyk.sarif
@@ -350,12 +365,6 @@ jobs:
       image-ref:    ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}@${{ steps.build-push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-artifacts-${{ github.sha }}
-          path: target/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -381,9 +390,12 @@ jobs:
 
       - name: Build and push image
         id: build-push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          context:    .
+          # The Dockerfile COPYs requirements.txt and src/ relative to app/,
+          # so app/ — not the repo root — is the build context.
+          context:    ./${{ env.APP_DIR }}
+          file:       ./${{ env.APP_DIR }}/Dockerfile
           push:       ${{ github.event_name != 'pull_request' }}
           tags:       ${{ steps.meta.outputs.tags }}
           labels:     ${{ steps.meta.outputs.labels }}
@@ -417,7 +429,7 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref:  ${{ env.FULL_IMAGE }}
           format:     sarif
@@ -483,25 +495,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
       - name: Start application for DAST scan
         run: |
           docker run -d --name app-under-test \
             -p 8080:8080 \
-            -e SPRING_PROFILES_ACTIVE=test \
+            -e ENVIRONMENT=dast \
+            -e APP_VERSION="${{ github.sha }}" \
             "${{ needs.image-build.outputs.image-ref }}"
-          # Wait for app to be healthy
-          timeout 60 bash -c 'until curl -sf http://localhost:8080/actuator/health; do sleep 2; done'
+
+          # Flask app exposes /healthz, not Spring Boot's /actuator/health.
+          timeout 60 bash -c \
+            'until curl -sf "http://localhost:8080${{ env.HEALTH_PATH }}"; do sleep 2; done'
 
       - name: OWASP ZAP Full Scan
-        uses: zaproxy/action-full-scan@v0.10.0
+        uses: zaproxy/action-full-scan@v0.12.0
         with:
           target:          "http://localhost:8080"
-          rules_file_name: ".zap/rules.tsv"
+          rules_file_name: "security/zap-rules.tsv"
           cmd_options:     "-a"
           allow_issue_writing: true
 
       - name: Upload ZAP SARIF
-        if: always()
+        if: always() && hashFiles('results/zap.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results/zap.sarif
@@ -580,6 +602,19 @@ jobs:
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
+      # cosign and argocd are used below but were never installed in this job.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Install ArgoCD CLI
+        run: |
+          sudo curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          sudo chmod +x /usr/local/bin/argocd
+          argocd version --client
+
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
@@ -599,9 +634,6 @@ jobs:
           ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
-          curl -sSL -o /usr/local/bin/argocd \
-            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
-          chmod +x /usr/local/bin/argocd
           argocd app set myapp-staging \
             --helm-set image.repository="${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}" \
             --helm-set image.tag="sha-${{ github.sha }}" \
@@ -614,11 +646,21 @@ jobs:
       - name: Run smoke tests against staging
         run: |
           STAGING_URL="${{ vars.STAGING_URL }}"
-          # Health check
-          curl -sf "${STAGING_URL}/actuator/health" | jq -e '.status == "UP"'
-          # Basic API smoke test
-          STATUS=$(curl -o /dev/null -sw "%{http_code}" "${STAGING_URL}/api/v1/health")
-          [ "$STATUS" = "200" ] || (echo "Smoke test failed: HTTP $STATUS" && exit 1)
+
+          # Liveness + readiness (Flask endpoints, not Spring actuator)
+          curl -sf "${STAGING_URL}${{ env.HEALTH_PATH }}" | jq -e '.status == "ok"'
+          curl -sf "${STAGING_URL}/readyz"                | jq -e '.status == "ready"'
+
+          # API smoke test
+          STATUS=$(curl -o /dev/null -sw "%{http_code}" "${STAGING_URL}/api/v1/info")
+          [ "$STATUS" = "200" ] || { echo "Smoke test failed: HTTP $STATUS"; exit 1; }
+
+          # Security headers must survive the deploy
+          HEADERS=$(curl -sI "${STAGING_URL}${{ env.HEALTH_PATH }}")
+          echo "$HEADERS" | grep -qi "x-content-type-options: nosniff" \
+            || { echo "Missing X-Content-Type-Options header"; exit 1; }
+          echo "$HEADERS" | grep -qi "strict-transport-security" \
+            || { echo "Missing HSTS header"; exit 1; }
 
 # =============================================================================
 # JOB 12 — Manual Approval Gate → Production Deploy (Blue/Green)
@@ -637,6 +679,18 @@ jobs:
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Install ArgoCD CLI
+        run: |
+          sudo curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          sudo chmod +x /usr/local/bin/argocd
+          argocd version --client
 
       - name: Set AKS production context
         uses: azure/aks-set-context@v4
@@ -671,7 +725,8 @@ jobs:
         run: |
           # Validate green slot before switching traffic
           GREEN_URL="${{ vars.PRODUCTION_GREEN_URL }}"
-          curl -sf "${GREEN_URL}/actuator/health" | jq -e '.status == "UP"'
+          curl -sf "${GREEN_URL}${{ env.HEALTH_PATH }}" | jq -e '.status == "ok"'
+          curl -sf "${GREEN_URL}/readyz"                | jq -e '.status == "ready"'
 
           # Patch ingress / service to point to green
           kubectl patch service myapp-prod \

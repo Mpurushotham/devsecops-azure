@@ -1,0 +1,52 @@
+# kube-linter configuration — referenced by the kube-linter pre-commit hook.
+# Previously the hook pointed at devsecops/security/.kube-linter.yaml, which did
+# not exist, so Kubernetes manifests were never linted.
+#
+# The checks below mirror what Kyverno enforces at admission time
+# (kubernetes/security/kyverno/policies/) so violations are caught locally
+# instead of at deploy time.
+
+checks:
+  addAllBuiltIn: false
+
+  include:
+    # ── Mirrors kyverno/require-non-root.yaml ────────────────────────────────
+    - run-as-non-root
+    - privileged-container
+    - privilege-escalation-container
+
+    # ── Mirrors kyverno/require-resource-limits.yaml ─────────────────────────
+    - unset-cpu-requirements
+    - unset-memory-requirements
+
+    # ── Mirrors kyverno/require-image-digest.yaml ────────────────────────────
+    - latest-tag
+
+    # ── Container hardening ──────────────────────────────────────────────────
+    - drop-net-raw-capability
+    - no-read-only-root-fs
+    - sensitive-host-mounts
+    - host-network
+    - host-pid
+    - host-ipc
+    - docker-sock
+
+    # ── Reliability (paged on during seasonal traffic spikes) ────────────────
+    - no-liveness-probe
+    - no-readiness-probe
+    - dangling-service
+    - mismatching-selector
+    - non-existent-service-account
+    - unsafe-sysctls
+    - deprecated-service-account-field
+    - env-var-secret
+    - ssh-port
+
+  exclude:
+    # Observability agents (Falco, Fluent Bit, node-exporter) legitimately need
+    # host mounts and privileged access; they are reviewed as infrastructure and
+    # live in the `security`/`monitoring` namespaces whose PodSecurity level is
+    # deliberately `privileged`/`baseline`.
+    - default-service-account
+
+customChecks: []

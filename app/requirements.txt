@@ -1,4 +1,10 @@
 # Production dependencies — pin all versions for reproducible builds
+#
+# setuptools is a genuine runtime dependency here: opentelemetry-instrumentation
+# 0.45b0 imports pkg_resources at module load, and python:3.12-slim ships no
+# setuptools. Without it the container crashes on startup with
+# "ModuleNotFoundError: No module named 'pkg_resources'".
+setuptools==75.6.0
 flask==3.0.3
 gunicorn==22.0.0
 prometheus-client==0.20.0
