@@ -116,11 +116,39 @@ jobs:
           category:   trivy-iac
 
   # ── Plan every environment on every PR ─────────────────────────────────────
+  # Azure-dependent jobs need a subscription and OIDC federation. Without them
+  # there is nothing meaningful to plan, so they skip with a notice rather than
+  # failing every PR — the same treatment SonarQube, Snyk, FOSSA and the DAST
+  # environment already get. `validate` still runs and is a genuine gate: fmt,
+  # tflint, terraform validate and the IaC scan need no cloud access.
+  azure-configured:
+    name: Check Azure configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Check for Azure credentials
+        id: check
+        env:
+          CLIENT_ID:       ${{ vars.TF_AZURE_CLIENT_ID }}
+          TENANT_ID:       ${{ vars.AZURE_TENANT_ID }}
+          SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          STATE_SA:        ${{ vars.TF_STATE_SA }}
+        run: |
+          if [ -n "${CLIENT_ID}" ] && [ -n "${TENANT_ID}" ] \
+             && [ -n "${SUBSCRIPTION_ID}" ] && [ -n "${STATE_SA}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Azure variables not configured — skipping plan/apply. Static analysis still ran."
+          fi
+
   plan:
     name: Plan (${{ matrix.environment }})
     runs-on: ubuntu-24.04
-    needs: validate
-    if: github.event_name == 'pull_request'
+    needs: [validate, azure-configured]
+    if: github.event_name == 'pull_request' && needs.azure-configured.outputs.enabled == 'true'
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -262,8 +290,10 @@ jobs:
   apply:
     name: Apply (${{ github.event.inputs.environment || 'dev' }})
     runs-on: ubuntu-24.04
-    needs: validate
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [validate, azure-configured]
+    if: >-
+      needs.azure-configured.outputs.enabled == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     timeout-minutes: 60
     environment: ${{ github.event.inputs.environment || 'dev' }}
     defaults:
