@@ -1,0 +1,289 @@
+# =============================================================================
+# Azure DevOps — Terraform plan and apply
+# =============================================================================
+# The organisation runs both GitHub Actions and Azure DevOps. Rather than
+# maintaining two divergent implementations, this pipeline mirrors
+# .github/workflows/lab-terraform.yml step for step: same Terraform version,
+# same gates, same CVSS policy. A change to one is expected to land in both,
+# and the acceptance criterion is that a service can move between them without
+# its security posture changing (ADR-016).
+#
+# Authentication is Workload Identity Federation — the ADO service connection
+# federates into Entra ID, so there is no service principal secret in a
+# variable group, exactly as with the GitHub OIDC path.
+# =============================================================================
+
+name: terraform-$(Build.SourceBranchName)-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include:
+      - lab/terraform/*
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include:
+      - lab/terraform/*
+
+variables:
+  - group: platform-common          # non-secret config
+  - group: platform-secrets         # Key Vault-backed variable group
+  - name: TF_VERSION
+    value: "1.10.3"
+  - name: TF_IN_AUTOMATION
+    value: "true"
+  - name: TF_INPUT
+    value: "false"
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+  # ── Stage 1: static analysis ───────────────────────────────────────────────
+  - stage: Validate
+    displayName: Validate and scan
+    jobs:
+      - job: StaticAnalysis
+        displayName: fmt, lint, validate, scan
+        timeoutInMinutes: 20
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform $(TF_VERSION)
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: terraform fmt -check -recursive -diff lab/terraform
+            displayName: terraform fmt
+
+          - script: |
+              set -euo pipefail
+              curl -sSfL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+              FAILED=0
+              for dir in lab/terraform/modules/*/ lab/terraform/envs/*/ lab/terraform/bootstrap/; do
+                echo "--- tflint ${dir}"
+                ( cd "$dir"
+                  tflint --init --config="$(Build.SourcesDirectory)/.tflint.hcl" >/dev/null
+                  tflint --config="$(Build.SourcesDirectory)/.tflint.hcl" --format compact
+                ) || FAILED=1
+              done
+              exit $FAILED
+            displayName: tflint
+
+          - script: |
+              set -euo pipefail
+              FAILED=0
+              for dir in lab/terraform/modules/*/ lab/terraform/envs/*/ lab/terraform/bootstrap/; do
+                echo "--- validate ${dir}"
+                ( cd "$dir" && terraform init -backend=false && terraform validate ) || FAILED=1
+              done
+              exit $FAILED
+            displayName: terraform validate
+
+          - script: |
+              set -euo pipefail
+              curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+                sudo sh -s -- -b /usr/local/bin v0.58.1
+
+              # exit-code 0: the gate below applies the CVSS policy, matching
+              # the GitHub Actions implementation.
+              trivy config lab/terraform \
+                --format sarif \
+                --output trivy-iac.sarif \
+                --severity CRITICAL,HIGH \
+                --ignorefile .trivyignore.yaml \
+                --exit-code 0
+            displayName: Trivy IaC scan
+
+          - script: |
+              python3 - <<'PYEOF'
+              import json, os, sys
+
+              if not os.path.exists("trivy-iac.sarif"):
+                  print("No SARIF — treating as clean.")
+                  sys.exit(0)
+
+              sarif = json.load(open("trivy-iac.sarif"))
+              critical = high = 0
+              for run in sarif.get("runs", []):
+                  for r in run.get("results", []):
+                      if r.get("level") == "error":
+                          critical += 1
+                          print(f"##vso[task.logissue type=error]CRITICAL {r.get('ruleId')}")
+                      elif r.get("level") == "warning":
+                          high += 1
+                          print(f"##vso[task.logissue type=warning]HIGH {r.get('ruleId')}")
+
+              print(f"IaC scan — CRITICAL: {critical}, HIGH: {high}")
+              if critical:
+                  sys.exit(1)
+              PYEOF
+            displayName: Enforce CVSS thresholds
+
+          - publish: trivy-iac.sarif
+            artifact: trivy-iac-sarif
+            condition: succeededOrFailed()
+            displayName: Publish SARIF
+
+  # ── Stage 2: plan every environment ────────────────────────────────────────
+  - stage: Plan
+    displayName: Plan
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: Plan
+        strategy:
+          matrix:
+            dev:
+              environmentName: dev
+            staging:
+              environmentName: staging
+            prod:
+              environmentName: prod
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          # Workload identity federation: no client secret is stored anywhere.
+          - task: AzureCLI@2
+            displayName: terraform plan
+            inputs:
+              azureSubscription: sc-platform-$(environmentName)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: lab/terraform/envs/$(environmentName)
+              inlineScript: |
+                set -euo pipefail
+                export ARM_USE_OIDC=true
+                export ARM_USE_AZUREAD=true
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_OIDC_TOKEN="$idToken"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(AZURE_SUBSCRIPTION_ID)"
+
+                terraform init \
+                  -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                  -backend-config="storage_account_name=$(TF_STATE_SA)" \
+                  -backend-config="container_name=tfstate-$(environmentName)" \
+                  -backend-config="key=$(environmentName).terraform.tfstate"
+
+                terraform plan -no-color -out=tfplan | tee plan.txt
+
+                # Destructive changes are the highest-risk output of this
+                # pipeline — surface the count instead of hiding it in the diff.
+                terraform show -json tfplan > plan.json
+                DESTROYS=$(python3 -c "
+                import json
+                p=json.load(open('plan.json'))
+                print(sum(1 for c in p.get('resource_changes',[])
+                          if 'delete' in c.get('change',{}).get('actions',[])))")
+                echo "Resources to destroy: ${DESTROYS}"
+                if [ "${DESTROYS}" -gt 0 ]; then
+                  echo "##vso[task.logissue type=warning]Plan destroys ${DESTROYS} resource(s) in $(environmentName)"
+                fi
+
+          - publish: lab/terraform/envs/$(environmentName)/plan.txt
+            artifact: plan-$(environmentName)
+            displayName: Publish plan
+
+  # ── Stage 3: apply, gated per environment ──────────────────────────────────
+  # The `environment:` keyword binds to an ADO Environment with approval checks,
+  # which is where the production sign-off lives — not in this file.
+  - stage: ApplyDev
+    displayName: Apply — dev
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ApplyDev
+        environment: platform-dev
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+                - task: AzureCLI@2
+                  displayName: terraform apply
+                  inputs:
+                    azureSubscription: sc-platform-dev
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    workingDirectory: lab/terraform/envs/dev
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_USE_OIDC=true
+                      export ARM_USE_AZUREAD=true
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_OIDC_TOKEN="$idToken"
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_SUBSCRIPTION_ID="$(AZURE_SUBSCRIPTION_ID)"
+
+                      terraform init \
+                        -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                        -backend-config="storage_account_name=$(TF_STATE_SA)" \
+                        -backend-config="container_name=tfstate-dev" \
+                        -backend-config="key=dev.terraform.tfstate"
+
+                      # Re-plan against this exact commit rather than replaying
+                      # a plan file from an earlier revision.
+                      terraform plan -out=tfplan
+                      terraform apply -auto-approve tfplan
+
+  - stage: ApplyProd
+    displayName: Apply — production
+    dependsOn: ApplyDev
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ApplyProd
+        # Approval and business-hours checks are configured on this Environment
+        # in the ADO UI; the pipeline cannot bypass them.
+        environment: platform-prod
+        timeoutInMinutes: 120
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+                - task: AzureCLI@2
+                  displayName: terraform apply
+                  inputs:
+                    azureSubscription: sc-platform-prod
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    workingDirectory: lab/terraform/envs/prod
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_USE_OIDC=true
+                      export ARM_USE_AZUREAD=true
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_OIDC_TOKEN="$idToken"
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_SUBSCRIPTION_ID="$(AZURE_SUBSCRIPTION_ID)"
+
+                      terraform init \
+                        -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                        -backend-config="storage_account_name=$(TF_STATE_SA)" \
+                        -backend-config="container_name=tfstate-prod" \
+                        -backend-config="key=prod.terraform.tfstate"
+
+                      terraform plan -out=tfplan
+                      terraform apply -auto-approve tfplan

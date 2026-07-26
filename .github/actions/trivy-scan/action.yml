@@ -1,0 +1,146 @@
+# =============================================================================
+# Composite action — Trivy scan
+# =============================================================================
+# Replaces aquasecurity/trivy-action, whose bundled installer failed on the
+# hosted runners: it printed "found version: 0.65.0" and then exited 1 without
+# producing a usable binary, taking every SCA and image-scan job with it.
+#
+# Installing a checksum-verified release asset directly is more reliable and
+# removes a third-party action from the supply chain — the same reasoning
+# already applied to gitleaks and TruffleHog in security-gates.yml.
+#
+# Inputs are passed through `env:` rather than interpolated into the shell.
+# `${{ }}` inside a `run:` block is textual substitution *before* the shell
+# runs, so a value containing shell metacharacters executes as code
+# (semgrep: run-shell-injection). Reading "$INPUT_X" is inert.
+#
+# The scan always exits 0; the caller applies the repo CVSS policy to the SARIF.
+# =============================================================================
+
+name: Trivy scan
+description: Install a pinned Trivy and scan a filesystem path, config tree or image.
+
+inputs:
+  scan-type:
+    description: 'fs | config | image'
+    required: true
+    default: fs
+  scan-ref:
+    description: Path or image reference to scan.
+    required: true
+  output:
+    description: SARIF output path.
+    required: true
+  severity:
+    description: Comma-separated severities to report.
+    required: false
+    default: CRITICAL,HIGH
+  ignore-unfixed:
+    description: Skip vulnerabilities with no available fix.
+    required: false
+    default: "true"
+  ignorefile:
+    description: Path to a .trivyignore.yaml, relative to the workspace.
+    required: false
+    default: ""
+  scanners:
+    description: Scanners to enable (vuln, secret, misconfig, license).
+    required: false
+    default: vuln
+  trivy-version:
+    description: Trivy version to install, without the leading v.
+    required: false
+    default: "0.72.0"
+
+runs:
+  using: composite
+  steps:
+    # Downloads the release asset directly rather than piping the upstream
+    # install.sh to sudo sh — deterministic, checksum-verified, and no
+    # third-party script in the execution path (semgrep: gha-curl-pipe-shell).
+    - name: Install Trivy
+      shell: bash
+      env:
+        INPUT_TRIVY_VERSION: ${{ inputs.trivy-version }}
+      run: |
+        set -euo pipefail
+
+        if command -v trivy >/dev/null 2>&1; then
+          echo "Trivy already present: $(trivy --version | head -1)"
+          exit 0
+        fi
+
+        VERSION="${INPUT_TRIVY_VERSION#v}"
+        BASE="https://github.com/aquasecurity/trivy/releases/download/v${VERSION}"
+        TARBALL="trivy_${VERSION}_Linux-64bit.tar.gz"
+
+        TMP="$(mktemp -d)"
+        curl -sSfL -o "${TMP}/${TARBALL}"     "${BASE}/${TARBALL}"
+        curl -sSfL -o "${TMP}/checksums.txt"  "${BASE}/trivy_${VERSION}_checksums.txt"
+
+        # A tampered release asset is exactly the supply-chain attack this
+        # scanner exists to catch, so verify before executing it.
+        ( cd "${TMP}" && grep " ${TARBALL}\$" checksums.txt | sha256sum -c - )
+
+        tar -xzf "${TMP}/${TARBALL}" -C "${TMP}" trivy
+        sudo install -m 0755 "${TMP}/trivy" /usr/local/bin/trivy
+        rm -rf "${TMP}"
+
+        trivy --version
+
+    # The vulnerability database is large and rate-limited on anonymous pulls;
+    # caching keeps repeated PR runs fast and reliable.
+    - name: Cache Trivy DB
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.cache/trivy
+        key: trivy-db-${{ inputs.trivy-version }}-${{ github.run_id }}
+        restore-keys: |
+          trivy-db-${{ inputs.trivy-version }}-
+
+    - name: Run Trivy
+      shell: bash
+      env:
+        TRIVY_CACHE_DIR:      ${{ github.workspace }}/.cache/trivy
+        INPUT_SCAN_TYPE:      ${{ inputs.scan-type }}
+        INPUT_SCAN_REF:       ${{ inputs.scan-ref }}
+        INPUT_OUTPUT:         ${{ inputs.output }}
+        INPUT_SEVERITY:       ${{ inputs.severity }}
+        INPUT_IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+        INPUT_IGNOREFILE:     ${{ inputs.ignorefile }}
+        INPUT_SCANNERS:       ${{ inputs.scanners }}
+      run: |
+        set -euo pipefail
+
+        ARGS=(
+          "${INPUT_SCAN_TYPE}"
+          "--format" "sarif"
+          "--output" "${INPUT_OUTPUT}"
+          "--severity" "${INPUT_SEVERITY}"
+          # Always 0: the caller's CVSS gate decides pass/fail, so a scan
+          # failure and a policy violation are never conflated.
+          "--exit-code" "0"
+        )
+
+        # `trivy config` accepts neither --no-progress, --scanners nor
+        # --ignore-unfixed; passing them prints usage and exits non-zero.
+        if [ "${INPUT_SCAN_TYPE}" != "config" ]; then
+          ARGS+=("--no-progress" "--scanners" "${INPUT_SCANNERS}")
+          [ "${INPUT_IGNORE_UNFIXED}" = "true" ] && ARGS+=("--ignore-unfixed")
+        fi
+
+        if [ -n "${INPUT_IGNOREFILE}" ] && [ -f "${INPUT_IGNOREFILE}" ]; then
+          ARGS+=("--ignorefile" "${INPUT_IGNOREFILE}")
+        fi
+
+        ARGS+=("${INPUT_SCAN_REF}")
+
+        echo "trivy ${ARGS[*]}"
+        trivy "${ARGS[@]}"
+
+        # A missing report would make the downstream gate silently pass.
+        if [ ! -f "${INPUT_OUTPUT}" ]; then
+          echo "::error::Trivy produced no SARIF at ${INPUT_OUTPUT}"
+          exit 1
+        fi
+        echo "Wrote ${INPUT_OUTPUT}"

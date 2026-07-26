@@ -1,0 +1,74 @@
+# =============================================================================
+# ArgoCD app-of-apps — the single root the platform is bootstrapped from
+# =============================================================================
+# ADR-014: One root Application per environment points at a directory of child
+# Applications. Bootstrapping a new cluster is then `kubectl apply -f` of this
+# one file; everything else converges from git.
+#
+# Promotion is a git operation, not a pipeline permission. The CD pipeline
+# updates an image digest in the environment's values file and opens a PR —
+# it never holds cluster credentials. That inverts the usual blast radius: a
+# compromised pipeline can propose a change, not make one.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-root
+  namespace: argocd
+  finalizers:
+    # Cascade deletion, so removing the root does not orphan every child.
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/part-of: platform
+spec:
+  project: platform
+
+  source:
+    repoURL: https://github.com/Mpurushotham/devsecops-azure.git
+    targetRevision: main
+    path: lab/kubernetes/apps/overlays/prod
+
+    directory:
+      recurse: true
+      exclude: "{README.md,kustomization.yaml}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # Prune: a resource deleted from git is deleted from the cluster, or git
+      # stops being the source of truth and drift accumulates silently.
+      prune: true
+      # Self-heal reverts manual kubectl edits. Painful the first time someone
+      # hotfixes by hand; it is the reason the cluster matches git during an
+      # incident review.
+      selfHeal: true
+      allowEmpty: false
+
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+      - RespectIgnoreDifferences=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
+
+  # The HPA and KEDA own replica counts at runtime; without this ArgoCD would
+  # fight the autoscaler and flap the deployment during a traffic spike.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+      jsonPointers:
+        - /spec/minReplicas

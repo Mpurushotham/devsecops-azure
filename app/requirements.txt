@@ -1,11 +1,17 @@
-# Production dependencies — pin all versions for reproducible builds
-flask==3.0.3
-gunicorn==22.0.0
-prometheus-client==0.20.0
-opentelemetry-api==1.24.0
-opentelemetry-sdk==1.24.0
-opentelemetry-exporter-otlp==1.24.0
-opentelemetry-instrumentation-flask==0.45b0
-cryptography==42.0.8
-pydantic==2.7.4
-structlog==24.2.0
+# Production dependencies — pin all versions for reproducible builds.
+#
+# No setuptools here, deliberately. opentelemetry-instrumentation 0.45b0
+# imported pkg_resources at module load, which forced setuptools into the
+# runtime image (and with it CVE-2025-47273). From 0.48b0 onward the import is
+# gone, so upgrading OTel removes the dependency, the CVE and ~2MB of image
+# rather than pinning a patched setuptools.
+flask==3.1.3
+gunicorn==26.0.0
+prometheus-client==0.26.0
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp==1.44.0
+opentelemetry-instrumentation-flask==0.65b0
+cryptography==49.0.0
+pydantic==2.13.4
+structlog==26.1.0

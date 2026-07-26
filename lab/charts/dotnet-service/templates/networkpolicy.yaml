@@ -1,0 +1,65 @@
+{{- if .Values.networkPolicy.enabled }}
+# Deny-all baseline. Cilium enforces this in eBPF, so there is no sidecar cost.
+# Anything not explicitly allowed below is dropped — including egress to the
+# internet, which is what stops a compromised pod from exfiltrating data.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dotnet-service.fullname" . }}
+  labels:
+    {{- include "dotnet-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dotnet-service.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- range .Values.networkPolicy.allowIngressFrom }}
+    - from:
+        - {{- toYaml . | nindent 10 }}
+      ports:
+        - port: {{ $.Values.service.targetPort }}
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.metrics.enabled }}
+    # Prometheus scrape path.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - port: {{ .Values.metrics.port }}
+          protocol: TCP
+    {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.allowDns }}
+    # Without DNS the pod cannot resolve the private endpoint FQDNs.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    # Telemetry to the in-cluster OTel collector.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - port: 4317
+          protocol: TCP
+    {{- range .Values.networkPolicy.allowEgressTo }}
+    # {{ .description }}
+    - ports:
+        {{- toYaml .ports | nindent 8 }}
+    {{- end }}
+{{- end }}

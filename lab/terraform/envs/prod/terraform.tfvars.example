@@ -1,0 +1,44 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored —
+# secrets belong in the pipeline's variable group or Key Vault, not here.
+
+subscription_id = "00000000-0000-0000-0000-000000000000"
+tenant_id       = "00000000-0000-0000-0000-000000000000"
+
+# 3-8 lowercase alphanumerics; makes ACR/Key Vault/SQL names globally unique.
+unique_suffix = "prd01"
+
+name_prefix = "rebtel-plat"
+location    = "swedencentral"
+vnet_cidr   = "10.10.0.0/16"
+
+kubernetes_version = "1.31"
+
+# Entra ID group object IDs.
+cluster_admin_group_object_ids  = ["00000000-0000-0000-0000-000000000000"]
+platform_admin_group_object_ids = ["00000000-0000-0000-0000-000000000000"]
+
+sql_admin_group_name      = "sg-platform-sql-admins"
+sql_admin_group_object_id = "00000000-0000-0000-0000-000000000000"
+
+database_name = "payments"
+
+github_repository    = "Mpurushotham/devsecops-azure"
+acr_geo_replications = ["westeurope"]
+
+enable_windows_pool = true
+
+# Flow logs need a pre-existing Network Watcher and storage account.
+enable_flow_logs            = false
+network_watcher_name        = "NetworkWatcher_swedencentral"
+flow_log_storage_account_id = ""
+
+cost_centre = "platform-engineering"
+owning_team = "platform-engineering"
+
+oncall_emails = ["platform-oncall@example.com"]
+
+# Supply these via TF_VAR_* from the pipeline secret store, not in this file.
+# pagerduty_webhook_url = ""
+# slack_webhook_url     = ""
+# elastic_api_key       = ""
+# datadog_api_key       = ""

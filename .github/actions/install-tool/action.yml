@@ -1,0 +1,72 @@
+# =============================================================================
+# Composite action — install a pinned, checksum-verified release binary
+# =============================================================================
+# Replaces `curl ... | sh` across the workflows (semgrep: gha-curl-pipe-shell).
+#
+# Piping a remote script into a shell means executing whatever that URL returns
+# at that moment, with no pin and no verification. For a repository whose whole
+# purpose is supply-chain assurance, that is the one place it should not happen:
+# these tools (syft, grype) *produce the SBOM and the vulnerability report*, so
+# a compromised installer compromises the evidence as well as the build.
+#
+# Every tool here is downloaded at a pinned version and verified against the
+# publisher's checksums file before it is allowed to run.
+# =============================================================================
+
+name: Install tool
+description: Download and checksum-verify a pinned release binary.
+
+inputs:
+  tool:
+    description: 'syft | grype | cosign | gitleaks'
+    required: true
+  version:
+    description: Version without the leading v.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install ${{ inputs.tool }}
+      shell: bash
+      env:
+        TOOL:    ${{ inputs.tool }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        V="${VERSION#v}"
+
+        case "${TOOL}" in
+          syft)
+            BASE="https://github.com/anchore/syft/releases/download/v${V}"
+            TARBALL="syft_${V}_linux_amd64.tar.gz"
+            SUMS="syft_${V}_checksums.txt"
+            ;;
+          grype)
+            BASE="https://github.com/anchore/grype/releases/download/v${V}"
+            TARBALL="grype_${V}_linux_amd64.tar.gz"
+            SUMS="grype_${V}_checksums.txt"
+            ;;
+          gitleaks)
+            BASE="https://github.com/gitleaks/gitleaks/releases/download/v${V}"
+            TARBALL="gitleaks_${V}_linux_x64.tar.gz"
+            SUMS="gitleaks_${V}_checksums.txt"
+            ;;
+          *)
+            echo "::error::Unsupported tool '${TOOL}'. Add it here rather than piping curl to a shell."
+            exit 1
+            ;;
+        esac
+
+        TMP="$(mktemp -d)"
+        curl -sSfL -o "${TMP}/${TARBALL}" "${BASE}/${TARBALL}"
+        curl -sSfL -o "${TMP}/${SUMS}"    "${BASE}/${SUMS}"
+
+        ( cd "${TMP}" && grep " ${TARBALL}\$" "${SUMS}" | sha256sum -c - )
+
+        tar -xzf "${TMP}/${TARBALL}" -C "${TMP}" "${TOOL}"
+        sudo install -m 0755 "${TMP}/${TOOL}" "/usr/local/bin/${TOOL}"
+        rm -rf "${TMP}"
+
+        "${TOOL}" version 2>/dev/null || "${TOOL}" --version

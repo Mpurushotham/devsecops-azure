@@ -1,0 +1,49 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.coverage
+coverage.xml
+junit.xml
+.pytest_cache/
+
+# ── Terraform ────────────────────────────────────────────────────────────────
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+# Never commit real variable values — only *.tfvars.example is tracked.
+*.auto.tfvars
+terraform.tfvars
+
+# ── Security scan output ─────────────────────────────────────────────────────
+*.sarif
+sbom-output/
+sbom-*.json
+trivy-*.json
+grype-*.json
+trufflehog.jsonl
+license-report.json
+node-license-report.json
+.zap/
+
+# ── Kubernetes / Helm ────────────────────────────────────────────────────────
+kubeconfig
+*.kubeconfig
+charts/*.tgz
+
+# ── Local tooling ────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ── Lab ──────────────────────────────────────────────────────────────────────
+lab/**/backend.hcl

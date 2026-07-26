@@ -1,0 +1,120 @@
+# =============================================================================
+# ArgoCD AppProject — the tenancy boundary
+# =============================================================================
+# Without a project, every Application can deploy any resource to any namespace
+# on any cluster ArgoCD knows about. These projects are what make "the payments
+# team can deploy payments" a technical statement rather than a social one.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  description: Platform components — ingress, observability, policy, autoscaling
+
+  sourceRepos:
+    - https://github.com/Mpurushotham/devsecops-azure.git
+    # Upstream charts the platform installs. An explicit list, because a
+    # wildcard here means any chart from anywhere can land in the cluster.
+    - https://kubernetes.github.io/ingress-nginx
+    - https://charts.jetstack.io
+    - https://kedacore.github.io/charts
+    - https://kyverno.github.io/kyverno
+    - https://open-telemetry.github.io/opentelemetry-helm-charts
+    - https://prometheus-community.github.io/helm-charts
+    - https://grafana.github.io/helm-charts
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+
+  # Platform components legitimately need cluster-scoped resources.
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  roles:
+    - name: platform-admin
+      description: Full control over platform Applications
+      policies:
+        - p, proj:platform:platform-admin, applications, *, platform/*, allow
+      groups:
+        - platform-engineering
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payments
+  namespace: argocd
+spec:
+  description: Payments domain services
+
+  sourceRepos:
+    - https://github.com/Mpurushotham/devsecops-azure.git
+
+  # A service team deploys into its own namespaces and nowhere else.
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: payments
+    - server: https://kubernetes.default.svc
+      namespace: payments-jobs
+
+  # No cluster-scoped resources: a workload chart has no business creating
+  # ClusterRoles or mutating webhooks.
+  clusterResourceWhitelist: []
+
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: batch
+      kind: CronJob
+    - group: batch
+      kind: Job
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: keda.sh
+      kind: ScaledObject
+    - group: keda.sh
+      kind: TriggerAuthentication
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: monitoring.coreos.com
+      kind: ServiceMonitor
+    - group: monitoring.coreos.com
+      kind: PrometheusRule
+    - group: secrets-store.csi.x-k8s.io
+      kind: SecretProviderClass
+
+  # Explicitly deny Secret creation: secrets come from Key Vault through the
+  # CSI driver, never from a manifest in git.
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: Secret
+
+  roles:
+    - name: payments-developer
+      description: Sync and read payments Applications; cannot change their definition
+      policies:
+        - p, proj:payments:payments-developer, applications, get, payments/*, allow
+        - p, proj:payments:payments-developer, applications, sync, payments/*, allow
+        - p, proj:payments:payments-developer, applications, action/*, payments/*, allow
+      groups:
+        - payments-engineering

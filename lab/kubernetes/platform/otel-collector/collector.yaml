@@ -1,0 +1,159 @@
+# =============================================================================
+# OpenTelemetry Collector — the single telemetry egress point
+# =============================================================================
+# ADR-015: Applications speak OTLP to the collector and nothing else. The
+# collector decides what is sampled, what is scrubbed and where it is
+# forwarded. Changing observability vendor is then a collector config change,
+# not a redeploy of every service.
+#
+# Tail sampling is the load-bearing part: head sampling at 10% would throw away
+# 90% of errors, which are exactly the traces anyone wants during an incident.
+# The policies below keep 100% of errors and slow requests, and sample the
+# boring successful traffic at 5%.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: platform
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            # Services can burst on a spike; without a limit the collector
+            # becomes the memory hog that takes the node down with it.
+            max_recv_msg_size_mib: 8
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      # Must be first: it drops data under memory pressure instead of OOMing.
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.deployment.name
+            - k8s.pod.name
+            - k8s.node.name
+          labels:
+            - tag_name: app
+              key: app.kubernetes.io/name
+              from: pod
+
+      # Strip anything that could carry cardholder or personal data before it
+      # leaves the cluster. Redaction at the collector means a service that logs
+      # too much is contained rather than a breach.
+      attributes/scrub:
+        actions:
+          - key: http.request.header.authorization
+            action: delete
+          - key: http.request.header.cookie
+            action: delete
+          - key: db.statement
+            action: delete
+          - key: card.number
+            action: delete
+          - key: user.email
+            action: hash
+
+      tail_sampling:
+        # Long enough for a full request tree to arrive from every service.
+        decision_wait: 10s
+        num_traces: 100000
+        expected_new_traces_per_sec: 1000
+        policies:
+          - name: errors-always
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+
+          - name: slow-requests-always
+            type: latency
+            latency:
+              threshold_ms: 1000
+
+          # Payment flows are always sampled: their traces are the audit trail
+          # for a transaction, not just debugging data.
+          - name: payment-flows-always
+            type: string_attribute
+            string_attribute:
+              key: http.route
+              values: ["/api/v1/payments.*"]
+              enabled_regex_matching: true
+
+          - name: probabilistic-rest
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 5
+
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+
+      resourcedetection:
+        detectors: [env, azure, system]
+        timeout: 5s
+
+    exporters:
+      # Traces and request telemetry.
+      azuremonitor:
+        connection_string: ${env:APPLICATIONINSIGHTS_CONNECTION_STRING}
+        maxbatchsize: 1024
+        maxbatchinterval: 10s
+
+      # Metrics scraped by managed Prometheus.
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        resource_to_telemetry_conversion:
+          enabled: true
+
+      # Application logs for engineer-facing search in Kibana.
+      elasticsearch:
+        endpoints: ["${env:ELASTIC_ENDPOINT}"]
+        logs_index: platform-logs
+        auth:
+          authenticator: bearertokenauth
+        retry:
+          enabled: true
+          max_requests: 3
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      bearertokenauth:
+        token: ${env:ELASTIC_API_KEY}
+
+    service:
+      extensions: [health_check, bearertokenauth]
+      telemetry:
+        metrics:
+          address: 0.0.0.0:8888
+        logs:
+          level: info
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resourcedetection, attributes/scrub, tail_sampling, batch]
+          exporters: [azuremonitor]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resourcedetection, batch]
+          exporters: [prometheus]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resourcedetection, attributes/scrub, batch]
+          exporters: [elasticsearch]

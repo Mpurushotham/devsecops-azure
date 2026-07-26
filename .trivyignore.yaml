@@ -1,0 +1,34 @@
+# =============================================================================
+# Trivy misconfiguration exceptions — repository-wide
+# =============================================================================
+# Every entry needs a justification and an expiry date. An exception without a
+# review date becomes permanent by accident, which is how a suppression file
+# turns into a list of accepted vulnerabilities nobody remembers accepting.
+#
+# Reviewed at each platform quarterly review.
+# =============================================================================
+
+misconfigurations:
+  - id: AZU-0041
+    paths:
+      - "*envs/dev/*"
+      - "*envs/staging/*"
+      - "*modules/aks/*"
+    statement: |
+      "Cluster does not limit API access to specific IP addresses."
+
+      False positive at the static-analysis level. dev and staging run a public
+      API server (so GitHub-hosted runners can deploy without the self-hosted
+      runner fleet production requires), but access IS restricted:
+
+        - lab/terraform/modules/aks sets api_server_access_profile.authorized_ip_ranges via a
+          dynamic block, which Trivy does not evaluate.
+        - The env-level variable api_server_authorized_ip_ranges has no default
+          and a length > 0 validation, so `terraform apply` cannot run without
+          explicit CIDRs.
+        - lab/terraform/modules/aks carries a lifecycle precondition that fails the plan if a
+          public cluster has an empty range list.
+
+      Production is unaffected: it runs a private cluster with no public
+      endpoint at all, and Trivy reports it clean.
+    expiry_date: 2027-01-31

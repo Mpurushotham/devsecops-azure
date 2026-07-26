@@ -9,6 +9,10 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--unsafe]
+        # Helm templates are Go templates, not YAML — `{{- if }}` at the start
+        # of a document is a parse error for any YAML loader. They are validated
+        # by `helm lint`/`helm template` in the lab CI workflow instead.
+        exclude: ^lab/charts/.*/templates/.*\.yaml$
       - id: check-json
       - id: check-toml
       - id: check-merge-conflict
@@ -46,7 +50,7 @@ repos:
     hooks:
       - id: gitleaks
         name: Gitleaks — detect hardcoded secrets
-        args: [--config=devsecops/security/.gitleaks.toml]
+        args: [--config=security/.gitleaks.toml]
 
   # ── Terraform security ────────────────────────────────────────────────────
   - repo: https://github.com/antonbabenko/pre-commit-terraform
@@ -56,20 +60,22 @@ repos:
       - id: terraform_validate
       - id: terraform_tflint
         args:
-          - --args=--config=__GIT_WORKING_DIR__/devsecops/.tflint.hcl
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
       - id: terraform_trivy
         args:
           - --args=--severity=CRITICAL,HIGH
           - --args=--exit-code=1
+          # Exceptions live in one reviewed file with justifications and expiry
+          # dates, rather than as scattered inline ignore comments.
+          - --args=--ignorefile=__GIT_WORKING_DIR__/.trivyignore.yaml
 
   # ── Kubernetes manifest linting ───────────────────────────────────────────
-  - repo: https://github.com/hadolint/hadolint
-    rev: v2.12.0
+  - repo: local
     hooks:
-      - id: hadolint-docker
+      - id: hadolint
         name: Hadolint — Dockerfile linting
         entry: hadolint
-        language: docker
+        language: system
         types: [dockerfile]
 
   - repo: https://github.com/stackrox/kube-linter
@@ -77,8 +83,8 @@ repos:
     hooks:
       - id: kube-linter
         name: kube-linter — Kubernetes security checks
-        args: [--config=devsecops/security/.kube-linter.yaml]
-        files: kubernetes/.*\.(yaml|yml)$
+        args: [--config=security/.kube-linter.yaml]
+        files: ^(kubernetes|lab/kubernetes)/.*\.(yaml|yml)$
 
   # ── Python security ───────────────────────────────────────────────────────
   - repo: https://github.com/PyCQA/bandit
@@ -94,7 +100,11 @@ repos:
     rev: v1.35.1
     hooks:
       - id: yamllint
-        args: [-d, relaxed]
+        # No --strict: rules marked `error` in .yamllint.yaml (duplicate keys,
+        # syntax) fail the hook, while cosmetic warnings such as line length in
+        # embedded shell/Python heredocs stay informational.
+        args: [-c, .yamllint.yaml]
+        exclude: ^lab/charts/.*/templates/.*\.yaml$
 
   # ── Commit message linting ────────────────────────────────────────────────
   - repo: https://github.com/commitizen-tools/commitizen

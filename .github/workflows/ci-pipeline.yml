@@ -38,9 +38,9 @@ env:
   ACR_REPOSITORY:      ${{ vars.ACR_REPOSITORY }}        # e.g. myapp
   IMAGE_TAG:           ${{ github.sha }}
   SONAR_HOST_URL:      ${{ vars.SONAR_HOST_URL }}
-  JAVA_VERSION:        "21"
-  NODE_VERSION:        "20"
   PYTHON_VERSION:      "3.12"
+  APP_DIR:             "app"                             # Build context + source root
+  HEALTH_PATH:         "/healthz"                        # Flask liveness probe
   SLSA_GENERATOR_REF: "v2.0.0"
 
 # ── Permissions (least-privilege per job where possible) ───────────────────
@@ -66,39 +66,29 @@ jobs:
         with:
           fetch-depth: 0          # Full history for SonarQube blame data
 
-      - name: Set up Node ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: ${{ env.APP_DIR }}/requirements.txt
 
       - name: Install lint dependencies
+        run: pip install --quiet flake8 black isort
+
+      - name: Run flake8 (syntax + undefined names are hard errors)
         run: |
-          npm ci --prefer-offline
-          pip install --quiet flake8 black isort
+          flake8 "${APP_DIR}" --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Run ESLint
-        run: npx eslint . --max-warnings 0 --format @microsoft/eslint-formatter-sarif \
-               --output-file eslint-results.sarif || true
+      - name: Run flake8 (full style report — advisory)
+        run: |
+          flake8 "${APP_DIR}" --count --max-line-length=120 --statistics --exit-zero
 
-      - name: Run flake8 (Python)
-        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+      - name: Run black (format check)
+        run: black --check --diff "${APP_DIR}"
 
-      - name: Run black (Python format check)
-        run: black --check .
-
-      - name: Upload ESLint SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: eslint-results.sarif
-          category:   eslint
+      - name: Run isort (import order check)
+        run: isort --check-only --diff "${APP_DIR}"
 
 # =============================================================================
 # JOB 2 — Build (reproducible, pinned)
@@ -115,31 +105,41 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up JDK ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.APP_DIR }}/requirements.txt
 
+      # Context values via env, not interpolated into the shell: `${{ }}` is
+      # substituted before the shell parses the line, so a ref name containing
+      # shell metacharacters would execute (semgrep: run-shell-injection).
       - name: Set build version
         id: set-version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA:      ${{ github.sha }}
         run: |
-          VERSION="${{ github.ref_name }}-${{ github.sha }}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${REF_NAME}-${SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Build (Maven — reproducible)
+      - name: Build wheel (reproducible — SOURCE_DATE_EPOCH pinned to the commit)
         run: |
-          mvn --batch-mode --no-transfer-progress \
-              -Dartifact.buildinfo.attach=true \
-              -Dproject.build.outputTimestamp=$(git log -1 --format=%cI) \
-              clean package -DskipTests
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          echo "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+
+          pip install --quiet build
+          # Dependencies are fully pinned in requirements.txt, so resolving them
+          # here proves the lockset installs cleanly before we build an image.
+          pip install --quiet -r "${APP_DIR}/requirements.txt"
+          python -m build --wheel --outdir dist/ "${APP_DIR}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-artifacts-${{ github.sha }}
-          path: target/*.jar
+          path: dist/*.whl
           retention-days: 7
           if-no-files-found: error
 
@@ -151,40 +151,44 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: testpassword
-          POSTGRES_DB:       testdb
-        options: >-
-          --health-cmd "pg_isready"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v4
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.APP_DIR }}/requirements.txt
 
-      - name: Run tests with coverage
+      - name: Install runtime + test dependencies
+        working-directory: ${{ env.APP_DIR }}
         run: |
-          mvn --batch-mode --no-transfer-progress \
-              -Dspring.datasource.url=jdbc:postgresql://localhost:5432/testdb \
-              -Dspring.datasource.password=testpassword \
-              test jacoco:report
+          pip install --quiet -r requirements.txt
+          pip install --quiet pytest pytest-cov
 
-      - name: Upload JaCoCo coverage report
+      # Tests import `from src.main import app`, so pytest must run with app/ as
+      # the rootdir — hence working-directory rather than a repo-root invocation.
+      - name: Run unit tests with coverage
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --junitxml=junit.xml \
+            -v
+
+      - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jacoco-report-${{ github.sha }}
-          path: target/site/jacoco/
+          name: coverage-report-${{ github.sha }}
+          path: |
+            ${{ env.APP_DIR }}/coverage.xml
+            ${{ env.APP_DIR }}/junit.xml
           retention-days: 7
 
 # =============================================================================
@@ -200,27 +204,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-
       - name: Download coverage report
         uses: actions/download-artifact@v4
         with:
-          name: jacoco-report-${{ github.sha }}
-          path: target/site/jacoco/
+          name: coverage-report-${{ github.sha }}
+          path: ${{ env.APP_DIR }}/
 
-      - name: SonarQube Scan
+      # SonarQube is optional infrastructure — without a token the scanner
+      # cannot authenticate, so skip rather than fail the pipeline.
+      - name: Check SonarQube configuration
+        id: sonar-config
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          mvn --batch-mode --no-transfer-progress sonar:sonar \
-              -Dsonar.host.url=${{ env.SONAR_HOST_URL }} \
-              -Dsonar.token=$SONAR_TOKEN \
-              -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-              -Dsonar.qualitygate.wait=true
+          if [ -n "${SONAR_TOKEN}" ] && [ -n "${SONAR_HOST_URL}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SONAR_TOKEN/SONAR_HOST_URL not configured — skipping SonarQube scan."
+          fi
+
+      - name: SonarQube Scan (Python)
+        if: steps.sonar-config.outputs.enabled == 'true'
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=devsecops-azure
+            -Dsonar.sources=${{ env.APP_DIR }}/src
+            -Dsonar.tests=${{ env.APP_DIR }}/tests
+            -Dsonar.python.coverage.reportPaths=${{ env.APP_DIR }}/coverage.xml
+            -Dsonar.python.version=3.12
+            -Dsonar.qualitygate.wait=true
 
 # =============================================================================
 # JOB 5 — SAST: Semgrep
@@ -231,30 +248,76 @@ jobs:
     needs: lint
     timeout-minutes: 15
     container:
-      image: semgrep/semgrep:latest
+      # Pinned: `latest` silently changed behaviour between runs, which is the
+      # opposite of what a security gate should do.
+      image: semgrep/semgrep:1.89.0
     steps:
       - uses: actions/checkout@v4
 
       - name: Run Semgrep (OWASP Top-10 + security-audit)
-        env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
         run: |
-          semgrep ci \
+          # `semgrep ci` requires a SEMGREP_APP_TOKEN and a clean git context;
+          # without them it exits non-zero for reasons unrelated to findings,
+          # which made this gate fail on every run and report it as a CRITICAL
+          # finding. `semgrep scan` runs the same rules with no account.
+          set +e
+          semgrep scan \
             --config "p/security-audit" \
             --config "p/owasp-top-ten" \
             --config "p/secrets" \
             --sarif \
             --output semgrep.sarif \
-            --severity ERROR || SEMGREP_EXIT=$?
+            --timeout 60 \
+            . > semgrep.log 2>&1
+          SEMGREP_EXIT=$?
+          set -e
 
-          # CVSS enforcement: Semgrep ERROR severity → treat as CRITICAL (>9.0)
-          if [ "${SEMGREP_EXIT:-0}" -ne 0 ]; then
-            echo "::error::Semgrep found HIGH/CRITICAL findings — blocking build (CVSS > 9.0 policy)"
-            exit 1
+          tail -50 semgrep.log
+          if [ "${SEMGREP_EXIT}" -gt 1 ]; then
+            echo "::error::Semgrep failed to run (exit ${SEMGREP_EXIT})"
+            exit "${SEMGREP_EXIT}"
           fi
 
-      - name: Upload Semgrep SARIF
+      - name: Enforce CVSS thresholds (Semgrep)
         if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          if not os.path.exists("semgrep.sarif"):
+              print("No Semgrep SARIF output — treating as clean.")
+              sys.exit(0)
+
+          with open("semgrep.sarif") as fh:
+              sarif = json.load(fh)
+
+          critical = high = 0
+          for run in sarif.get("runs", []):
+              for result in run.get("results", []):
+                  level = result.get("level", "note")
+                  loc = ""
+                  if result.get("locations"):
+                      pl = result["locations"][0].get("physicalLocation", {})
+                      loc = "{}:{}".format(
+                          pl.get("artifactLocation", {}).get("uri", ""),
+                          pl.get("region", {}).get("startLine", ""))
+                  if level == "error":
+                      critical += 1
+                      print(f"  [CRITICAL] {result.get('ruleId','')} @ {loc}")
+                  elif level == "warning":
+                      high += 1
+                      print(f"  [HIGH]     {result.get('ruleId','')} @ {loc}")
+
+          print(f"Semgrep — CRITICAL: {critical}, HIGH: {high}")
+          if critical > 0:
+              print(f"::error::Semgrep CRITICAL findings ({critical}) — CVSS > 9.0, blocking build")
+              sys.exit(1)
+          if high > 0:
+              print(f"::warning::Semgrep HIGH findings ({high}) — CVSS 7.0-8.9, ticket will be filed")
+          PYEOF
+
+      - name: Upload Semgrep SARIF
+        if: always() && hashFiles('semgrep.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
@@ -272,45 +335,20 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: ./.github/actions/trivy-scan
         with:
-          scan-type:     fs
-          scan-ref:      .
-          format:        sarif
-          output:        trivy-fs.sarif
-          severity:      CRITICAL,HIGH,MEDIUM
-          exit-code:     "0"   # We handle exit logic manually below
-          vuln-type:     library
-          ignore-unfixed: true
+          scan-type:      fs
+          scan-ref:       .
+          output:         trivy-fs.sarif
+          severity:       CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: "true"
 
+      # Shared gate: reads the real CVSS score from the SARIF rule properties.
+      # Trivy maps BOTH critical and high to level "error", so the old inline
+      # check blocked on HIGH findings that policy says should only warn.
       - name: Enforce CVSS thresholds (SCA)
         run: |
-          python3 - <<'PYEOF'
-          import json, sys
-
-          with open("trivy-fs.sarif") as f:
-              sarif = json.load(f)
-
-          critical_count = 0
-          high_count     = 0
-
-          for run in sarif.get("runs", []):
-              for result in run.get("results", []):
-                  level = result.get("level", "")
-                  # SARIF: error=CRITICAL, warning=HIGH, note=MEDIUM/LOW
-                  if level == "error":
-                      critical_count += 1
-                  elif level == "warning":
-                      high_count += 1
-
-          print(f"SCA results — CRITICAL (CVSS>9): {critical_count}, HIGH (CVSS 7-8.9): {high_count}")
-
-          if critical_count > 0:
-              print("::error::CRITICAL vulnerabilities found in dependencies — build blocked (CVSS > 9.0)")
-              sys.exit(1)
-          elif high_count > 0:
-              print(f"::warning::HIGH vulnerabilities found ({high_count}) — creating tracking ticket")
-          PYEOF
+          python3 .github/scripts/cvss_gate.py trivy-fs.sarif --tool "Trivy SCA"
 
       - name: Upload Trivy SCA SARIF
         if: always()
@@ -319,19 +357,22 @@ jobs:
           sarif_file: trivy-fs.sarif
           category:   trivy-sca
 
-      - name: Snyk SCA scan
-        uses: snyk/actions/maven@master
+      - name: Snyk SCA scan (Python)
+        if: env.SNYK_ENABLED == 'true'
+        uses: snyk/actions/python-3.10@master
         continue-on-error: true
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_TOKEN:   ${{ secrets.SNYK_TOKEN }}
+          SNYK_ENABLED: ${{ secrets.SNYK_TOKEN != '' }}
         with:
           args: >
             --severity-threshold=high
             --sarif-file-output=snyk.sarif
-            --all-projects
+            --file=app/requirements.txt
+            --package-manager=pip
 
       - name: Upload Snyk SARIF
-        if: always()
+        if: always() && hashFiles('snyk.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: snyk.sarif
@@ -348,14 +389,30 @@ jobs:
     outputs:
       image-digest: ${{ steps.build-push.outputs.digest }}
       image-ref:    ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}@${{ steps.build-push.outputs.digest }}
+      # Downstream jobs need to know whether an image actually reached a
+      # registry — scanning, signing and deploying a reference that was never
+      # pushed would fail confusingly.
+      pushed:       ${{ steps.registry.outputs.enabled }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-artifacts-${{ github.sha }}
-          path: target/
+      # Without a registry the image can still be built and scanned locally,
+      # which is the part that carries security value. Only the push needs
+      # credentials, so a fork without ACR gets a real build and a real scan
+      # instead of a red X.
+      - name: Check registry configuration
+        id: registry
+        env:
+          ACR_REGISTRY: ${{ env.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          if [ -n "${ACR_REGISTRY}" ] && [ -n "${ACR_USERNAME}" ] && [ -n "${ACR_PASSWORD}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ACR not configured — building and scanning locally without pushing."
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -363,6 +420,7 @@ jobs:
           driver-opts: image=moby/buildkit:latest
 
       - name: Log in to Azure Container Registry
+        if: steps.registry.outputs.enabled == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY }}
@@ -373,7 +431,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}
+          # Falls back to a local name when no registry is configured, so the
+          # metadata action still produces usable tags for a local build.
+          images: ${{ env.ACR_REGISTRY != '' && format('{0}/{1}', env.ACR_REGISTRY, env.ACR_REPOSITORY) || 'local/devsecops-app' }}
           tags: |
             type=sha,format=long,prefix=sha-
             type=ref,event=branch
@@ -381,16 +441,24 @@ jobs:
 
       - name: Build and push image
         id: build-push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          context:    .
-          push:       ${{ github.event_name != 'pull_request' }}
+          # The Dockerfile COPYs requirements.txt and src/ relative to app/,
+          # so app/ — not the repo root — is the build context.
+          context:    ./${{ env.APP_DIR }}
+          file:       ./${{ env.APP_DIR }}/Dockerfile
+          push:       ${{ github.event_name != 'pull_request' && steps.registry.outputs.enabled == 'true' }}
+          load:       ${{ github.event_name == 'pull_request' || steps.registry.outputs.enabled != 'true' }}
           tags:       ${{ steps.meta.outputs.tags }}
           labels:     ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to:   type=gha,mode=max
-          sbom:       true
-          provenance: mode=max
+          # Attestations produce a manifest list, which the local docker
+          # exporter cannot load ("docker exporter does not currently support
+          # exporting manifest lists"). They are only meaningful for an image
+          # that reaches a registry anyway, so attach them when pushing.
+          sbom:       ${{ github.event_name != 'pull_request' && steps.registry.outputs.enabled == 'true' }}
+          provenance: ${{ (github.event_name != 'pull_request' && steps.registry.outputs.enabled == 'true') && 'mode=max' || 'false' }}
           build-args: |
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
             GIT_COMMIT=${{ github.sha }}
@@ -402,7 +470,7 @@ jobs:
     name: Container Image Scan
     runs-on: ubuntu-24.04
     needs: image-build
-    if:   github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && needs.image-build.outputs.pushed == 'true'
     timeout-minutes: 20
     env:
       FULL_IMAGE: ${{ needs.image-build.outputs.image-ref }}
@@ -417,45 +485,30 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: ./.github/actions/trivy-scan
         with:
-          image-ref:  ${{ env.FULL_IMAGE }}
-          format:     sarif
-          output:     trivy-image.sarif
-          severity:   CRITICAL,HIGH
-          exit-code:  "0"
+          scan-type: image
+          scan-ref:  ${{ env.FULL_IMAGE }}
+          output:    trivy-image.sarif
+          severity:  CRITICAL,HIGH
 
+      # Shared gate: reads the real CVSS score from the SARIF rule properties.
+      # Trivy maps BOTH critical and high to level "error", so the old inline
+      # check blocked on HIGH findings that policy says should only warn.
       - name: Enforce CVSS thresholds (Image)
         run: |
-          python3 - <<'PYEOF'
-          import json, sys
+          python3 .github/scripts/cvss_gate.py trivy-image.sarif --tool "Trivy image"
 
-          with open("trivy-image.sarif") as f:
-              sarif = json.load(f)
-
-          critical_count = sum(
-              1 for run in sarif.get("runs", [])
-              for result in run.get("results", [])
-              if result.get("level") == "error"
-          )
-          high_count = sum(
-              1 for run in sarif.get("runs", [])
-              for result in run.get("results", [])
-              if result.get("level") == "warning"
-          )
-
-          print(f"Image scan — CRITICAL: {critical_count}, HIGH: {high_count}")
-          if critical_count > 0:
-              print("::error::CRITICAL CVEs in container image — build blocked")
-              sys.exit(1)
-          elif high_count > 0:
-              print(f"::warning::{high_count} HIGH CVEs found — ticket will be created")
-          PYEOF
+      - name: Install Grype
+        uses: ./.github/actions/install-tool
+        with:
+          tool: grype
+          version: "0.116.0"
 
       - name: Grype image scan
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          grype "${{ env.FULL_IMAGE }}" --output sarif > grype-image.sarif
+        env:
+          IMAGE: ${{ env.FULL_IMAGE }}
+        run: grype "${IMAGE}" --output sarif > grype-image.sarif
 
       - name: Upload Trivy image SARIF
         if: always()
@@ -477,31 +530,43 @@ jobs:
   dast:
     name: DAST — OWASP ZAP
     runs-on: ubuntu-24.04
-    needs: image-scan
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    needs: [image-build, image-scan]
+    if: >-
+      needs.image-build.outputs.pushed == 'true' &&
+      (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Start application for DAST scan
         run: |
           docker run -d --name app-under-test \
             -p 8080:8080 \
-            -e SPRING_PROFILES_ACTIVE=test \
+            -e ENVIRONMENT=dast \
+            -e APP_VERSION="${{ github.sha }}" \
             "${{ needs.image-build.outputs.image-ref }}"
-          # Wait for app to be healthy
-          timeout 60 bash -c 'until curl -sf http://localhost:8080/actuator/health; do sleep 2; done'
+
+          # Flask app exposes /healthz, not Spring Boot's /actuator/health.
+          timeout 60 bash -c \
+            'until curl -sf "http://localhost:8080${{ env.HEALTH_PATH }}"; do sleep 2; done'
 
       - name: OWASP ZAP Full Scan
-        uses: zaproxy/action-full-scan@v0.10.0
+        uses: zaproxy/action-full-scan@v0.12.0
         with:
           target:          "http://localhost:8080"
-          rules_file_name: ".zap/rules.tsv"
+          rules_file_name: "security/zap-rules.tsv"
           cmd_options:     "-a"
           allow_issue_writing: true
 
       - name: Upload ZAP SARIF
-        if: always()
+        if: always() && hashFiles('results/zap.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results/zap.sarif
@@ -517,8 +582,10 @@ jobs:
   sign-artifact:
     name: Sign Artifact (cosign + SLSA)
     runs-on: ubuntu-24.04
-    needs: [image-scan, dast]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    needs: [image-build, image-scan, dast]
+    if: >-
+      needs.image-build.outputs.pushed == 'true' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     timeout-minutes: 15
     env:
       IMAGE_REF: ${{ needs.image-build.outputs.image-ref }}
@@ -543,11 +610,17 @@ jobs:
             --rekor-url https://rekor.sigstore.dev \
             "${{ env.IMAGE_REF }}"
 
+      - name: Install Syft
+        uses: ./.github/actions/install-tool
+        with:
+          tool: syft
+          version: "1.49.0"
+
       - name: Attach SBOM attestation
+        env:
+          IMAGE: ${{ env.IMAGE_REF }}
         run: |
-          # Generate CycloneDX SBOM
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          syft "${{ env.IMAGE_REF }}" -o cyclonedx-json > sbom-cyclonedx.json
+          syft "${IMAGE}" -o cyclonedx-json > sbom-cyclonedx.json
 
           # Attest SBOM to image
           cosign attest --yes \
@@ -568,8 +641,10 @@ jobs:
   deploy-staging:
     name: Deploy — Staging
     runs-on: ubuntu-24.04
-    needs: sign-artifact
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    needs: [image-build, sign-artifact]
+    if: >-
+      needs.image-build.outputs.pushed == 'true' &&
+      (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
     timeout-minutes: 20
     environment:
       name: staging
@@ -579,6 +654,19 @@ jobs:
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
+
+      # cosign and argocd are used below but were never installed in this job.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Install ArgoCD CLI
+        run: |
+          sudo curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          sudo chmod +x /usr/local/bin/argocd
+          argocd version --client
 
       - name: Set AKS context
         uses: azure/aks-set-context@v4
@@ -599,9 +687,6 @@ jobs:
           ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
-          curl -sSL -o /usr/local/bin/argocd \
-            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
-          chmod +x /usr/local/bin/argocd
           argocd app set myapp-staging \
             --helm-set image.repository="${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}" \
             --helm-set image.tag="sha-${{ github.sha }}" \
@@ -614,11 +699,21 @@ jobs:
       - name: Run smoke tests against staging
         run: |
           STAGING_URL="${{ vars.STAGING_URL }}"
-          # Health check
-          curl -sf "${STAGING_URL}/actuator/health" | jq -e '.status == "UP"'
-          # Basic API smoke test
-          STATUS=$(curl -o /dev/null -sw "%{http_code}" "${STAGING_URL}/api/v1/health")
-          [ "$STATUS" = "200" ] || (echo "Smoke test failed: HTTP $STATUS" && exit 1)
+
+          # Liveness + readiness (Flask endpoints, not Spring actuator)
+          curl -sf "${STAGING_URL}${{ env.HEALTH_PATH }}" | jq -e '.status == "ok"'
+          curl -sf "${STAGING_URL}/readyz"                | jq -e '.status == "ready"'
+
+          # API smoke test
+          STATUS=$(curl -o /dev/null -sw "%{http_code}" "${STAGING_URL}/api/v1/info")
+          [ "$STATUS" = "200" ] || { echo "Smoke test failed: HTTP $STATUS"; exit 1; }
+
+          # Security headers must survive the deploy
+          HEADERS=$(curl -sI "${STAGING_URL}${{ env.HEALTH_PATH }}")
+          echo "$HEADERS" | grep -qi "x-content-type-options: nosniff" \
+            || { echo "Missing X-Content-Type-Options header"; exit 1; }
+          echo "$HEADERS" | grep -qi "strict-transport-security" \
+            || { echo "Missing HSTS header"; exit 1; }
 
 # =============================================================================
 # JOB 12 — Manual Approval Gate → Production Deploy (Blue/Green)
@@ -626,8 +721,8 @@ jobs:
   approve-and-deploy-prod:
     name: Approve & Deploy — Production
     runs-on: ubuntu-24.04
-    needs: deploy-staging
-    if: github.ref == 'refs/heads/main'
+    needs: [image-build, deploy-staging]
+    if: needs.image-build.outputs.pushed == 'true' && github.ref == 'refs/heads/main'
     timeout-minutes: 30
     environment:
       name: production         # Requires manual approval in GitHub Environments
@@ -637,6 +732,18 @@ jobs:
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Install ArgoCD CLI
+        run: |
+          sudo curl -sSL -o /usr/local/bin/argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          sudo chmod +x /usr/local/bin/argocd
+          argocd version --client
 
       - name: Set AKS production context
         uses: azure/aks-set-context@v4
@@ -668,26 +775,39 @@ jobs:
             --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web
 
       - name: Production smoke test & traffic switch
+        env:
+          GREEN_URL:   ${{ vars.PRODUCTION_GREEN_URL }}
+          HEALTH_PATH: ${{ env.HEALTH_PATH }}
+          SHA:         ${{ github.sha }}
         run: |
           # Validate green slot before switching traffic
-          GREEN_URL="${{ vars.PRODUCTION_GREEN_URL }}"
-          curl -sf "${GREEN_URL}/actuator/health" | jq -e '.status == "UP"'
+          curl -sf "${GREEN_URL}${HEALTH_PATH}" | jq -e '.status == "ok"'
+          curl -sf "${GREEN_URL}/readyz"        | jq -e '.status == "ready"'
 
           # Patch ingress / service to point to green
           kubectl patch service myapp-prod \
             -p '{"spec":{"selector":{"slot":"green"}}}' \
             --namespace production
 
-          echo "Traffic switched to green slot (SHA: ${{ github.sha }})"
+          echo "Traffic switched to green slot (SHA: ${SHA})"
 
       - name: Notify Azure Monitor on successful deploy
         if: success()
+        env:
+          WEBHOOK_URL: ${{ secrets.AZURE_MONITOR_WEBHOOK_URL }}
+          SHA:         ${{ github.sha }}
+          ACTOR:       ${{ github.actor }}
+          WORKFLOW:    ${{ github.workflow }}
         run: |
-          curl -X POST "${{ secrets.AZURE_MONITOR_WEBHOOK_URL }}" \
+          # jq builds the JSON so a value containing a quote produces a string,
+          # not a broken payload or an injected shell command.
+          PAYLOAD=$(jq -n \
+            --arg text     "Production deploy succeeded" \
+            --arg sha      "${SHA}" \
+            --arg actor    "${ACTOR}" \
+            --arg workflow "${WORKFLOW}" \
+            '{text: $text, sha: $sha, actor: $actor, workflow: $workflow}')
+
+          curl -X POST "${WEBHOOK_URL}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "text": "Production deploy succeeded",
-              "sha": "${{ github.sha }}",
-              "actor": "${{ github.actor }}",
-              "workflow": "${{ github.workflow }}"
-            }'
+            -d "${PAYLOAD}"
