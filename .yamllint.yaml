@@ -1,0 +1,49 @@
+# yamllint configuration
+#
+# Starts from `relaxed` and tightens the rules that catch real bugs (duplicate
+# keys, bad indentation, truthy typos like `on:` vs `"on":`) while staying quiet
+# about cosmetics that would otherwise bury the signal.
+
+extends: relaxed
+
+ignore: |
+  # Go templates, not YAML — `{{- if }}` at the top of a document is a parse
+  # error for any YAML loader. Validated by `helm lint` and `helm template`
+  # in the lab CI workflow instead.
+  lab/charts/*/templates/
+  .terraform/
+  **/.terraform/
+
+rules:
+  # 80 chars is unworkable for Kubernetes manifests and GitHub Actions
+  # expressions; 140 still catches genuinely unreadable lines.
+  line-length:
+    max: 140
+    level: warning
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+
+  # A duplicated key silently discards the first value — always an error.
+  key-duplicates:
+    level: error
+
+  # GitHub Actions `on:` is parsed as boolean true by YAML 1.1 loaders; the
+  # check would flag every workflow, so allow the documented spellings.
+  truthy:
+    allowed-values: ["true", "false", "on", "off", "yes", "no"]
+    check-keys: false
+    level: warning
+
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 1
+    level: warning
+
+  indentation:
+    spaces: consistent
+    indent-sequences: consistent
+    level: warning
+
+  document-start: disable
+  empty-lines: disable
+  trailing-spaces: enable

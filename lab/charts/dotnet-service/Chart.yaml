@@ -1,0 +1,25 @@
+apiVersion: v2
+name: dotnet-service
+description: |
+  Opinionated chart for .NET services on the AKS platform. It encodes the
+  platform contract — workload identity, probes, autoscaling, disruption
+  budgets, network policy and Kyverno-compliant security context — so a service
+  team supplies an image and a few values rather than 400 lines of YAML.
+type: application
+
+# Chart version tracks the chart's own API; appVersion is overridden per
+# release by the CD pipeline with the image tag being deployed.
+version: 1.2.0
+appVersion: "1.0.0"
+
+keywords:
+  - dotnet
+  - aks
+  - platform
+
+maintainers:
+  - name: Platform Engineering
+    email: platform-engineering@example.com
+
+annotations:
+  platform.internal/contract-version: "1"

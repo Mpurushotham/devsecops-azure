@@ -1,0 +1,251 @@
+# =============================================================================
+# dotnet-service — default values
+# =============================================================================
+# Defaults are production-safe, not permissive: a service that overrides nothing
+# still gets non-root, dropped capabilities, a PDB, a network policy and
+# autoscaling. Teams opt out explicitly, which makes the exception reviewable.
+# =============================================================================
+
+replicaCount: 3
+
+image:
+  repository: ""            # e.g. acrrebtelplatprod.azurecr.io/payments-api
+  # Kyverno's require-image-digest policy rejects tags in production. The CD
+  # pipeline resolves the tag to a digest and sets this.
+  digest: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""
+  # Set to the client ID from the platform_identity module output. The pod then
+  # exchanges its projected SA token for an Entra token — no secret involved.
+  workloadIdentityClientId: ""
+  # Never mount the default SA token: nothing here talks to the Kubernetes API.
+  automountServiceAccountToken: false
+
+# ── Networking ───────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  appProtocol: http
+
+ingress:
+  enabled: false
+  className: nginx
+  host: ""
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: true
+    secretName: ""
+  annotations:
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # Blunt but effective first line against credential stuffing on payment
+    # endpoints; the WAF handles the sophisticated cases.
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+
+networkPolicy:
+  enabled: true
+  # Default deny-all, then these explicit allows. Egress to the internet is
+  # denied outright: a compromised pod cannot exfiltrate to an arbitrary host.
+  allowIngressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  allowEgressTo:
+    - ports:
+        - port: 1433
+          protocol: TCP
+      description: Azure SQL via private endpoint
+    - ports:
+        - port: 443
+          protocol: TCP
+      description: Key Vault, ACR and Entra ID over private endpoints
+  allowDns: true
+
+# ── Resources ────────────────────────────────────────────────────────────────
+# requests == limits for memory (no overcommit: the OOM killer is not a
+# scheduling strategy), while CPU has no limit — throttling a latency-sensitive
+# service to enforce a quota it is not exceeding makes p99 worse for no benefit.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 512Mi
+
+# ── Autoscaling ──────────────────────────────────────────────────────────────
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 30
+
+  # CPU is a lagging indicator for an IO-bound API; it is kept as a safety net
+  # while concurrency (below) drives the actual scaling decision.
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+  # Scale out fast, scale in slowly. During a seasonal spike, scaling in too
+  # eagerly causes a second scale-out a minute later and a latency sawtooth.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Min
+
+# KEDA scales on the signal that actually predicts load. For a queue consumer
+# that is RabbitMQ depth; for an API it is in-flight requests. Both react
+# before CPU does, which is the difference between absorbing a spike and
+# shedding it.
+keda:
+  enabled: false
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 3
+  maxReplicaCount: 50
+  triggers: []
+  # Example — RabbitMQ queue depth:
+  # triggers:
+  #   - type: rabbitmq
+  #     metadata:
+  #       protocol: amqp
+  #       queueName: payments-settlement
+  #       mode: QueueLength
+  #       value: "50"
+  #     authenticationRef:
+  #       name: rabbitmq-auth
+
+# ── Availability ─────────────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  # minAvailable as a percentage, so it stays correct as the HPA changes the
+  # replica count. Without a PDB, a node drain can take every replica at once.
+  minAvailable: 66%
+
+# Spread across zones first, then nodes. ScheduleAnyway rather than
+# DoNotSchedule: during a spike, a pod on a suboptimal node beats a pending pod.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels: {}
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels: {}
+
+nodeSelector:
+  workload-type: application
+
+tolerations: []
+affinity: {}
+
+# ── Probes ───────────────────────────────────────────────────────────────────
+# Liveness must not depend on the database (see Program.cs); readiness must.
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  # Startup probe gives a cold .NET process time to JIT without a slow start
+  # being misread as a liveness failure.
+  startup:
+    enabled: true
+    path: /healthz
+    periodSeconds: 5
+    failureThreshold: 30
+
+# Must exceed the app's SHUTDOWN_DRAIN_SECONDS plus the longest request.
+terminationGracePeriodSeconds: 45
+
+# ── Security context ─────────────────────────────────────────────────────────
+# These values are exactly what the Kyverno policies enforce at admission; the
+# chart sets them so no service is ever rejected at deploy time for them.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 64198
+  runAsGroup: 64198
+  fsGroup: 64198
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Writable scratch for a read-only root filesystem.
+volumes:
+  tmpDir:
+    enabled: true
+    sizeLimit: 64Mi
+
+# ── Configuration ────────────────────────────────────────────────────────────
+env:
+  ASPNETCORE_ENVIRONMENT: Production
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  SHUTDOWN_DRAIN_SECONDS: "5"
+
+# Non-secret settings.
+configMap:
+  enabled: false
+  data: {}
+
+# Secrets are mounted from Key Vault by the CSI driver; the chart never creates
+# a Kubernetes Secret from a value, which would put it in git and in state.
+keyVault:
+  enabled: false
+  name: ""
+  tenantId: ""
+  # userAssignedIdentityID is the same client ID as the service account.
+  secrets: []
+  # - objectName: payments-processor-api-key
+  #   objectType: secret
+  #   envVar: PAYMENT_PROCESSOR_KEY
+
+podAnnotations: {}
+podLabels: {}
+
+# ── Observability ────────────────────────────────────────────────────────────
+metrics:
+  enabled: true
+  path: /metrics
+  port: 8080
+  serviceMonitor:
+    enabled: true
+    interval: 30s

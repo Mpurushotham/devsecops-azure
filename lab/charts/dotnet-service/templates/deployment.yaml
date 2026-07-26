@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dotnet-service.fullname" . }}
+  labels:
+    {{- include "dotnet-service.labels" . | nindent 4 }}
+spec:
+  {{- if not (or .Values.autoscaling.enabled .Values.keda.enabled) }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never go below the current capacity mid-deploy: surge first, then
+      # terminate. During peak season a 25% dip while rolling is a real outage.
+      maxUnavailable: 0
+      maxSurge: 25%
+  selector:
+    matchLabels:
+      {{- include "dotnet-service.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll pods when config changes — otherwise a ConfigMap edit is silently
+        # ignored until something else triggers a restart.
+        {{- if .Values.configMap.enabled }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "dotnet-service.selectorLabels" . | nindent 8 }}
+        {{- if .Values.serviceAccount.workloadIdentityClientId }}
+        # Required for the workload identity webhook to inject the projected
+        # token volume and AZURE_* environment variables.
+        azure.workload.identity/use: "true"
+        {{- end }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "dotnet-service.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpreadConstraints }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "dotnet-service.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "dotnet-service.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            # Surfaced as OTel resource attributes so a trace can be traced back
+            # to the exact pod that served it.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- range .Values.keyVault.secrets }}
+            {{- if .envVar }}
+            - name: {{ .envVar }}
+              valueFrom:
+                secretKeyRef:
+                  # Synced by the CSI driver's secretObjects; the value lives in
+                  # Key Vault and is rotated there, not here.
+                  name: {{ include "dotnet-service.fullname" $ }}-kv
+                  key: {{ .objectName }}
+            {{- end }}
+            {{- end }}
+          {{- if .Values.configMap.enabled }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "dotnet-service.fullname" . }}
+          {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.volumes.tmpDir.enabled }}
+            # readOnlyRootFilesystem is on, so the runtime still needs somewhere
+            # to write temp files.
+            - name: tmp
+              mountPath: /tmp
+            {{- end }}
+            {{- if .Values.keyVault.enabled }}
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.volumes.tmpDir.enabled }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumes.tmpDir.sizeLimit }}
+        {{- end }}
+        {{- if .Values.keyVault.enabled }}
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "dotnet-service.fullname" . }}-kv
+        {{- end }}

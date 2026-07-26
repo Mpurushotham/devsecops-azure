@@ -9,6 +9,10 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--unsafe]
+        # Helm templates are Go templates, not YAML — `{{- if }}` at the start
+        # of a document is a parse error for any YAML loader. They are validated
+        # by `helm lint`/`helm template` in the lab CI workflow instead.
+        exclude: ^lab/charts/.*/templates/.*\.yaml$
       - id: check-json
       - id: check-toml
       - id: check-merge-conflict
@@ -61,6 +65,9 @@ repos:
         args:
           - --args=--severity=CRITICAL,HIGH
           - --args=--exit-code=1
+          # Exceptions live in one reviewed file with justifications and expiry
+          # dates, rather than as scattered inline ignore comments.
+          - --args=--ignorefile=__GIT_WORKING_DIR__/.trivyignore.yaml
 
   # ── Kubernetes manifest linting ───────────────────────────────────────────
   - repo: local
@@ -93,7 +100,8 @@ repos:
     rev: v1.35.1
     hooks:
       - id: yamllint
-        args: [-d, relaxed]
+        args: [-c, .yamllint.yaml, --strict]
+        exclude: ^lab/charts/.*/templates/.*\.yaml$
 
   # ── Commit message linting ────────────────────────────────────────────────
   - repo: https://github.com/commitizen-tools/commitizen

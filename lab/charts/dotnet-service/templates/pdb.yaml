@@ -1,0 +1,19 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dotnet-service.fullname" . }}
+  labels:
+    {{- include "dotnet-service.labels" . | nindent 4 }}
+spec:
+  # Percentage rather than a count, so the budget stays meaningful as the HPA
+  # changes the replica count during a spike.
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "dotnet-service.selectorLabels" . | nindent 6 }}
+{{- end }}

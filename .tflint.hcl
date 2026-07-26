@@ -18,12 +18,6 @@ plugin "azurerm" {
   source  = "github.com/terraform-linters/tflint-ruleset-azurerm"
 }
 
-plugin "google" {
-  enabled = true
-  version = "0.31.0"
-  source  = "github.com/terraform-linters/tflint-ruleset-google"
-}
-
 # ── Naming / hygiene ─────────────────────────────────────────────────────────
 rule "terraform_naming_convention" {
   enabled = true
