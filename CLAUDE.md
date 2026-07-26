@@ -72,20 +72,61 @@ independent root modules, not a composed workspace — apply each separately.
 `setup-aks.sh` runs `terraform apply` then installs, in order: cert-manager, Istio, Kyverno, Falco,
 kube-prometheus-stack/Loki/Tempo, ArgoCD, network policies. It is idempotent and re-runnable.
 
+### The `lab/` solution
+
+`lab/` is a second, self-contained Azure platform build (Terraform + GitOps + a .NET 10 workload). It
+has its own entrypoint and reuses this repo's security gates rather than forking them:
+
+```bash
+cd lab
+make help                    # all targets
+make check                   # fmt, tflint, validate, IaC scan, chart lint + contract assertions
+make plan ENV=dev            # ENV is one of dev|staging|prod
+make chart-policy            # assert 17 security properties on rendered Helm output
+```
+
+Read `lab/docs/DECISIONS.md` before changing anything there — the 17 ADRs record what each choice costs
+and what would justify revisiting it.
+
 ## Architecture conventions
 
 ### The CVSS threshold policy is the organizing rule
 
-Every scanning stage — in workflows, in `generate-sbom.sh`, in the docs — implements the same policy:
+Every scanning stage implements the same policy:
 
-- `CVSS ≥ 9.0` (SARIF `level: error`) → **fail the job**
-- `CVSS 7.0–8.9` (SARIF `level: warning`) → emit `::warning::` and open a tracking GitHub issue
+- `CVSS ≥ 9.0` → **fail the job**
+- `CVSS 7.0–8.9` → emit `::warning::` and open a tracking GitHub issue
 - `< 7.0` → log only
 
-Enforcement is always an inline `python3 - <<'PYEOF'` heredoc that parses the tool's SARIF output and
-counts `error`/`warning` results; the scanner action itself is run with `exit-code: "0"` so the heredoc
-owns the pass/fail decision. Any new scanner must follow this shape: emit SARIF → upload it to the
-Security tab with a distinct `category:` → gate on it in a heredoc.
+**Enforcement lives in one place: `.github/scripts/cvss_gate.py`.** It reads the real score from the
+SARIF rule property `security-severity`, falling back to the SARIF `level` only for scanners that
+publish no score. Do not reintroduce per-workflow logic, and in particular do not treat `level: error`
+as "critical" — Trivy maps *both* CRITICAL and HIGH to `error`, which is exactly the bug that made HIGH
+findings block builds the policy says should only warn.
+
+A new scanner follows this shape: emit SARIF → run the scan with `exit-code: 0` so a tool failure is
+distinguishable from a finding → gate with `cvss_gate.py` → upload to the Security tab with a distinct
+`category:`.
+
+### Scanner and tool installation
+
+Use the composite actions, not inline installs:
+
+- `.github/actions/trivy-scan` — pinned Trivy, checksum-verified, plus DB caching. The upstream
+  `install.sh` (and therefore `aquasecurity/trivy-action`) fails on hosted runners.
+- `.github/actions/install-tool` — syft, grype, gitleaks; downloads a pinned release asset and verifies
+  it against the publisher's checksums before executing.
+
+Never add `curl ... | sh`. These tools produce the SBOM and the vulnerability report, so a compromised
+installer compromises the evidence as well as the build.
+
+### Workflow shell safety
+
+Never interpolate `${{ }}` inside a `run:` block. It is textual substitution performed before the shell
+parses the line, so a value containing shell metacharacters executes as code. Pass values through `env:`
+and reference `"$VAR"`. Build JSON payloads with `jq -n --arg`, not hand-escaped strings. Semgrep's
+`run-shell-injection` and `gha-curl-pipe-shell` rules enforce both, and the repo currently scans clean at
+ERROR level.
 
 ### Workflows
 
