@@ -370,7 +370,7 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Trivy scan — full (OS + library)
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref:  ${{ env.IMAGE_REF }}
           format:     sarif
@@ -380,7 +380,7 @@ jobs:
           vuln-type:  os,library
 
       - name: Trivy scan — JSON (for artifact)
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref: ${{ env.IMAGE_REF }}
           format:    json

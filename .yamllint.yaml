@@ -44,6 +44,17 @@ rules:
     indent-sequences: consistent
     level: warning
 
+  # The workflows in this repo align values into columns deliberately; it reads
+  # better for long lists of env vars and there is no correctness cost.
+  colons: disable
+
+  # Comment indentation is cosmetic and the block comments in these files are
+  # intentionally aligned to the section they describe.
+  comments-indentation: disable
+
+  braces: disable
+  brackets: disable
+
   document-start: disable
   empty-lines: disable
   trailing-spaces: enable

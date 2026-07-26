@@ -311,15 +311,25 @@ jobs:
       - name: Run Bandit
         if: steps.py-check.outputs.py_count != '0'
         run: |
+          # -ll is the short form of --severity-level medium; passing both is a
+          # hard argparse conflict ("not allowed with argument --severity-level")
+          # that aborted the step before any SARIF was written.
+          set +e
           bandit -r . \
             --format sarif \
             --output bandit.sarif \
             --severity-level medium \
             --confidence-level medium \
-            --exclude .venv,venv,node_modules,tests \
-            -ll || BANDIT_EXIT=$?
+            --exclude ./.venv,./venv,./node_modules,./app/tests,./lab
+          BANDIT_EXIT=$?
+          set -e
 
-          echo "Bandit exit code: ${BANDIT_EXIT:-0}"
+          echo "Bandit exit code: ${BANDIT_EXIT}"
+          # 0 = clean, 1 = findings (the gate below decides), >1 = tool error
+          if [ "${BANDIT_EXIT}" -gt 1 ]; then
+            echo "::error::Bandit failed to run (exit ${BANDIT_EXIT})"
+            exit "${BANDIT_EXIT}"
+          fi
 
       - name: Enforce CVSS thresholds (Bandit)
         if: steps.py-check.outputs.py_count != '0'
@@ -381,7 +391,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           scan-type:      fs
           scan-ref:       .

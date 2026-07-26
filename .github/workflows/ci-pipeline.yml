@@ -127,7 +127,7 @@ jobs:
           pip install --quiet build
           # Dependencies are fully pinned in requirements.txt, so resolving them
           # here proves the lockset installs cleanly before we build an image.
-          pip install --quiet --require-hashes=false -r "${APP_DIR}/requirements.txt"
+          pip install --quiet -r "${APP_DIR}/requirements.txt"
           python -m build --wheel --outdir dist/ "${APP_DIR}"
 
       - name: Upload build artifacts
@@ -243,30 +243,76 @@ jobs:
     needs: lint
     timeout-minutes: 15
     container:
-      image: semgrep/semgrep:latest
+      # Pinned: `latest` silently changed behaviour between runs, which is the
+      # opposite of what a security gate should do.
+      image: semgrep/semgrep:1.89.0
     steps:
       - uses: actions/checkout@v4
 
       - name: Run Semgrep (OWASP Top-10 + security-audit)
-        env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
         run: |
-          semgrep ci \
+          # `semgrep ci` requires a SEMGREP_APP_TOKEN and a clean git context;
+          # without them it exits non-zero for reasons unrelated to findings,
+          # which made this gate fail on every run and report it as a CRITICAL
+          # finding. `semgrep scan` runs the same rules with no account.
+          set +e
+          semgrep scan \
             --config "p/security-audit" \
             --config "p/owasp-top-ten" \
             --config "p/secrets" \
             --sarif \
             --output semgrep.sarif \
-            --severity ERROR || SEMGREP_EXIT=$?
+            --timeout 60 \
+            . > semgrep.log 2>&1
+          SEMGREP_EXIT=$?
+          set -e
 
-          # CVSS enforcement: Semgrep ERROR severity → treat as CRITICAL (>9.0)
-          if [ "${SEMGREP_EXIT:-0}" -ne 0 ]; then
-            echo "::error::Semgrep found HIGH/CRITICAL findings — blocking build (CVSS > 9.0 policy)"
-            exit 1
+          tail -50 semgrep.log
+          if [ "${SEMGREP_EXIT}" -gt 1 ]; then
+            echo "::error::Semgrep failed to run (exit ${SEMGREP_EXIT})"
+            exit "${SEMGREP_EXIT}"
           fi
 
-      - name: Upload Semgrep SARIF
+      - name: Enforce CVSS thresholds (Semgrep)
         if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          if not os.path.exists("semgrep.sarif"):
+              print("No Semgrep SARIF output — treating as clean.")
+              sys.exit(0)
+
+          with open("semgrep.sarif") as fh:
+              sarif = json.load(fh)
+
+          critical = high = 0
+          for run in sarif.get("runs", []):
+              for result in run.get("results", []):
+                  level = result.get("level", "note")
+                  loc = ""
+                  if result.get("locations"):
+                      pl = result["locations"][0].get("physicalLocation", {})
+                      loc = "{}:{}".format(
+                          pl.get("artifactLocation", {}).get("uri", ""),
+                          pl.get("region", {}).get("startLine", ""))
+                  if level == "error":
+                      critical += 1
+                      print(f"  [CRITICAL] {result.get('ruleId','')} @ {loc}")
+                  elif level == "warning":
+                      high += 1
+                      print(f"  [HIGH]     {result.get('ruleId','')} @ {loc}")
+
+          print(f"Semgrep — CRITICAL: {critical}, HIGH: {high}")
+          if critical > 0:
+              print(f"::error::Semgrep CRITICAL findings ({critical}) — CVSS > 9.0, blocking build")
+              sys.exit(1)
+          if high > 0:
+              print(f"::warning::Semgrep HIGH findings ({high}) — CVSS 7.0-8.9, ticket will be filed")
+          PYEOF
+
+      - name: Upload Semgrep SARIF
+        if: always() && hashFiles('semgrep.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
@@ -284,7 +330,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           scan-type:     fs
           scan-ref:      .
@@ -429,7 +475,7 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref:  ${{ env.FULL_IMAGE }}
           format:     sarif

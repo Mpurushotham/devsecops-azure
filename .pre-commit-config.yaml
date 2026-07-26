@@ -100,7 +100,10 @@ repos:
     rev: v1.35.1
     hooks:
       - id: yamllint
-        args: [-c, .yamllint.yaml, --strict]
+        # No --strict: rules marked `error` in .yamllint.yaml (duplicate keys,
+        # syntax) fail the hook, while cosmetic warnings such as line length in
+        # embedded shell/Python heredocs stay informational.
+        args: [-c, .yamllint.yaml]
         exclude: ^lab/charts/.*/templates/.*\.yaml$
 
   # ── Commit message linting ────────────────────────────────────────────────
