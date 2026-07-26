@@ -112,11 +112,16 @@ jobs:
           cache: pip
           cache-dependency-path: ${{ env.APP_DIR }}/requirements.txt
 
+      # Context values via env, not interpolated into the shell: `${{ }}` is
+      # substituted before the shell parses the line, so a ref name containing
+      # shell metacharacters would execute (semgrep: run-shell-injection).
       - name: Set build version
         id: set-version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA:      ${{ github.sha }}
         run: |
-          VERSION="${{ github.ref_name }}-${{ github.sha }}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${REF_NAME}-${SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Build wheel (reproducible — SOURCE_DATE_EPOCH pinned to the commit)
         run: |
@@ -464,10 +469,16 @@ jobs:
         run: |
           python3 .github/scripts/cvss_gate.py trivy-image.sarif --tool "Trivy image"
 
+      - name: Install Grype
+        uses: ./.github/actions/install-tool
+        with:
+          tool: grype
+          version: "0.116.0"
+
       - name: Grype image scan
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          grype "${{ env.FULL_IMAGE }}" --output sarif > grype-image.sarif
+        env:
+          IMAGE: ${{ env.FULL_IMAGE }}
+        run: grype "${IMAGE}" --output sarif > grype-image.sarif
 
       - name: Upload Trivy image SARIF
         if: always()
@@ -565,11 +576,17 @@ jobs:
             --rekor-url https://rekor.sigstore.dev \
             "${{ env.IMAGE_REF }}"
 
+      - name: Install Syft
+        uses: ./.github/actions/install-tool
+        with:
+          tool: syft
+          version: "1.49.0"
+
       - name: Attach SBOM attestation
+        env:
+          IMAGE: ${{ env.IMAGE_REF }}
         run: |
-          # Generate CycloneDX SBOM
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          syft "${{ env.IMAGE_REF }}" -o cyclonedx-json > sbom-cyclonedx.json
+          syft "${IMAGE}" -o cyclonedx-json > sbom-cyclonedx.json
 
           # Attest SBOM to image
           cosign attest --yes \
@@ -722,27 +739,39 @@ jobs:
             --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web
 
       - name: Production smoke test & traffic switch
+        env:
+          GREEN_URL:   ${{ vars.PRODUCTION_GREEN_URL }}
+          HEALTH_PATH: ${{ env.HEALTH_PATH }}
+          SHA:         ${{ github.sha }}
         run: |
           # Validate green slot before switching traffic
-          GREEN_URL="${{ vars.PRODUCTION_GREEN_URL }}"
-          curl -sf "${GREEN_URL}${{ env.HEALTH_PATH }}" | jq -e '.status == "ok"'
-          curl -sf "${GREEN_URL}/readyz"                | jq -e '.status == "ready"'
+          curl -sf "${GREEN_URL}${HEALTH_PATH}" | jq -e '.status == "ok"'
+          curl -sf "${GREEN_URL}/readyz"        | jq -e '.status == "ready"'
 
           # Patch ingress / service to point to green
           kubectl patch service myapp-prod \
             -p '{"spec":{"selector":{"slot":"green"}}}' \
             --namespace production
 
-          echo "Traffic switched to green slot (SHA: ${{ github.sha }})"
+          echo "Traffic switched to green slot (SHA: ${SHA})"
 
       - name: Notify Azure Monitor on successful deploy
         if: success()
+        env:
+          WEBHOOK_URL: ${{ secrets.AZURE_MONITOR_WEBHOOK_URL }}
+          SHA:         ${{ github.sha }}
+          ACTOR:       ${{ github.actor }}
+          WORKFLOW:    ${{ github.workflow }}
         run: |
-          curl -X POST "${{ secrets.AZURE_MONITOR_WEBHOOK_URL }}" \
+          # jq builds the JSON so a value containing a quote produces a string,
+          # not a broken payload or an injected shell command.
+          PAYLOAD=$(jq -n \
+            --arg text     "Production deploy succeeded" \
+            --arg sha      "${SHA}" \
+            --arg actor    "${ACTOR}" \
+            --arg workflow "${WORKFLOW}" \
+            '{text: $text, sha: $sha, actor: $actor, workflow: $workflow}')
+
+          curl -X POST "${WEBHOOK_URL}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "text": "Production deploy succeeded",
-              "sha": "${{ github.sha }}",
-              "actor": "${{ github.actor }}",
-              "workflow": "${{ github.workflow }}"
-            }'
+            -d "${PAYLOAD}"

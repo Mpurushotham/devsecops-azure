@@ -152,10 +152,16 @@ jobs:
             VERSION=${{ github.ref_name }}
 
       - name: Output image references
+        env:
+          DIGEST:     ${{ steps.build-push.outputs.digest }}
+          REGISTRY:   ${{ env.ACR_REGISTRY }}
+          REPOSITORY: ${{ env.ACR_REPOSITORY }}
+          SHA:        ${{ github.sha }}
+          REF_NAME:   ${{ github.ref_name }}
         run: |
-          echo "Image digest:      ${{ steps.build-push.outputs.digest }}"
-          echo "Image ref (SHA):   ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:sha-${{ github.sha }}"
-          echo "Image ref (tag):   ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ github.ref_name }}"
+          echo "Image digest:      ${DIGEST}"
+          echo "Image ref (SHA):   ${REGISTRY}/${REPOSITORY}:sha-${SHA}"
+          echo "Image ref (tag):   ${REGISTRY}/${REPOSITORY}:${REF_NAME}"
 
 # =============================================================================
 # JOB 2 — Generate SBOMs (CycloneDX + SPDX via Syft)
@@ -179,9 +185,10 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Install Syft
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
-            sh -s -- -b /usr/local/bin v1.18.1
+        uses: ./.github/actions/install-tool
+        with:
+          tool: syft
+          version: "1.49.0"
 
       - name: Generate CycloneDX SBOM from image
         run: |
@@ -591,32 +598,43 @@ jobs:
     steps:
       - name: Determine overall status
         id: status
+        env:
+          RELEASE_RESULT: ${{ needs.create-github-release.result }}
         run: |
-          RESULT="${{ needs.create-github-release.result }}"
-          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+          echo "result=${RELEASE_RESULT}" >> "$GITHUB_OUTPUT"
 
       - name: Send Azure Monitor webhook notification
+        env:
+          STATUS:      ${{ steps.status.outputs.result }}
+          WEBHOOK_URL: ${{ secrets.AZURE_MONITOR_WEBHOOK_URL }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          SHA:         ${{ github.sha }}
+          ACTOR:       ${{ github.actor }}
+          REPO:        ${{ github.repository }}
+          WORKFLOW:    ${{ github.workflow }}
+          RUN_ID:      ${{ github.run_id }}
+          IMAGE_REF:   ${{ needs.build-and-push.outputs.image-ref }}
         run: |
-          STATUS="${{ steps.status.outputs.result }}"
-          COLOR=$([ "$STATUS" = "success" ] && echo "00C851" || echo "FF4444")
+          # jq builds the payload: hand-escaped JSON inside a shell string is
+          # both fragile and an injection vector (semgrep: run-shell-injection).
+          PAYLOAD=$(jq -n \
+            --arg status      "${STATUS}" \
+            --arg release_tag "${RELEASE_TAG}" \
+            --arg sha         "${SHA}" \
+            --arg actor       "${ACTOR}" \
+            --arg repo        "${REPO}" \
+            --arg workflow    "${WORKFLOW}" \
+            --arg run_url     "https://github.com/${REPO}/actions/runs/${RUN_ID}" \
+            --arg image_ref   "${IMAGE_REF}" \
+            '{schemaId: "AzureMonitorMetricAlert",
+              data: {status: $status, release_tag: $release_tag, sha: $sha,
+                     actor: $actor, repo: $repo, workflow: $workflow,
+                     run_url: $run_url, image_ref: $image_ref}}')
 
-          curl -X POST "${{ secrets.AZURE_MONITOR_WEBHOOK_URL }}" \
+          curl -X POST "${WEBHOOK_URL}" \
             -H "Content-Type: application/json" \
-            --retry 3 \
-            --retry-delay 5 \
-            -d "{
-              \"schemaId\": \"AzureMonitorMetricAlert\",
-              \"data\": {
-                \"status\":      \"${STATUS}\",
-                \"release_tag\": \"${{ env.RELEASE_TAG }}\",
-                \"sha\":         \"${{ github.sha }}\",
-                \"actor\":       \"${{ github.actor }}\",
-                \"repo\":        \"${{ github.repository }}\",
-                \"workflow\":    \"${{ github.workflow }}\",
-                \"run_url\":     \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
-                \"image_ref\":   \"${{ needs.build-and-push.outputs.image-ref }}\"
-              }
-            }"
+            --retry 3 --retry-delay 5 \
+            -d "${PAYLOAD}"
 
       - name: Post release summary to job summary
         run: |

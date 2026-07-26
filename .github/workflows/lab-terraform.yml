@@ -145,15 +145,20 @@ jobs:
           tenant-id:       ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # Backend values via env, not interpolated into the shell
+      # (semgrep: run-shell-injection).
       - name: terraform init
         env:
           ARM_USE_OIDC: "true"
+          STATE_RG:     ${{ vars.TF_STATE_RG }}
+          STATE_SA:     ${{ vars.TF_STATE_SA }}
+          ENVIRONMENT:  ${{ matrix.environment }}
         run: |
           terraform init \
-            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
-            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
-            -backend-config="container_name=tfstate-${{ matrix.environment }}" \
-            -backend-config="key=${{ matrix.environment }}.terraform.tfstate"
+            -backend-config="resource_group_name=${STATE_RG}" \
+            -backend-config="storage_account_name=${STATE_SA}" \
+            -backend-config="container_name=tfstate-${ENVIRONMENT}" \
+            -backend-config="key=${ENVIRONMENT}.terraform.tfstate"
 
       - name: terraform plan
         id: plan
@@ -189,11 +194,15 @@ jobs:
 
       - name: Comment plan on PR
         uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          DESTROY_COUNT: ${{ steps.destructive.outputs.count }}
         with:
           script: |
             const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
             let plan = fs.readFileSync(
-              'lab/terraform/envs/${{ matrix.environment }}/plan.txt', 'utf8');
+              `lab/terraform/envs/${env}/plan.txt`, 'utf8');
 
             // GitHub comments cap at 65536 chars; keep the tail, which holds
             // the summary line reviewers actually look for.
@@ -202,13 +211,13 @@ jobs:
               plan = '...(truncated)...\n' + plan.slice(-MAX);
             }
 
-            const destroys = '${{ steps.destructive.outputs.count }}';
+            const destroys = process.env.DESTROY_COUNT;
             const warning = destroys !== '0'
               ? `\n> **${destroys} resource(s) will be DESTROYED.** Review carefully.\n`
               : '';
 
             const body = [
-              `### Terraform plan — \`${{ matrix.environment }}\``,
+              `### Terraform plan — \`${env}\``,
               warning,
               '<details><summary>Show plan</summary>',
               '',
@@ -224,7 +233,7 @@ jobs:
               issue_number: context.issue.number,
             });
 
-            const marker = `### Terraform plan — \`${{ matrix.environment }}\``;
+            const marker = `### Terraform plan — \`${env}\``;
             const existing = comments.find(c =>
               c.user.type === 'Bot' && c.body.startsWith(marker));
 
@@ -243,8 +252,10 @@ jobs:
 
       - name: Fail if plan errored
         if: steps.plan.outputs.exitcode == '1'
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          echo "::error::terraform plan failed for ${{ matrix.environment }}"
+          echo "::error::terraform plan failed for ${ENVIRONMENT}"
           exit 1
 
   # ── Apply on merge, behind a protected environment ─────────────────────────
@@ -276,13 +287,15 @@ jobs:
       - name: terraform init
         env:
           ARM_USE_OIDC: "true"
+          STATE_RG:     ${{ vars.TF_STATE_RG }}
+          STATE_SA:     ${{ vars.TF_STATE_SA }}
+          ENVIRONMENT:  ${{ github.event.inputs.environment || 'dev' }}
         run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
           terraform init \
-            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
-            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
-            -backend-config="container_name=tfstate-${ENV}" \
-            -backend-config="key=${ENV}.terraform.tfstate"
+            -backend-config="resource_group_name=${STATE_RG}" \
+            -backend-config="storage_account_name=${STATE_SA}" \
+            -backend-config="container_name=tfstate-${ENVIRONMENT}" \
+            -backend-config="key=${ENVIRONMENT}.terraform.tfstate"
 
       # Plan and apply in the same job against the same commit: applying a plan
       # generated from a different revision is how "the plan looked fine" turns
@@ -299,9 +312,11 @@ jobs:
           terraform apply -auto-approve tfplan
 
       - name: Publish outputs to the job summary
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
         run: |
           {
-            echo "### Terraform outputs — ${{ github.event.inputs.environment || 'dev' }}"
+            echo "### Terraform outputs — ${ENVIRONMENT}"
             echo ""
             echo '```'
             # -json would include sensitive values; the human-readable form

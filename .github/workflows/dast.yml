@@ -97,8 +97,9 @@ jobs:
           AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
           ACR_USERNAME:      ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD:      ${{ secrets.ACR_PASSWORD }}
+          TARGET_URL_INPUT:  ${{ inputs.target_url }}
         run: |
-          OVERRIDE="${{ inputs.target_url }}"
+          OVERRIDE="${TARGET_URL_INPUT}"
           if [ -n "$OVERRIDE" ]; then
             echo "Using provided target URL: $OVERRIDE"
             echo "target_url=${OVERRIDE}"   >> "$GITHUB_OUTPUT"

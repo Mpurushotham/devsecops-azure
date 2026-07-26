@@ -75,10 +75,19 @@ jobs:
           echo "Rendered $(grep -c '^kind:' rendered.yaml) manifests"
 
       - name: Install kube-linter
+        env:
+          KUBE_LINTER_VERSION: "0.6.8"
         run: |
-          curl -sSfLO https://github.com/stackrox/kube-linter/releases/download/v0.6.8/kube-linter-linux.tar.gz
-          tar -xzf kube-linter-linux.tar.gz
-          sudo install -m 0755 kube-linter /usr/local/bin/kube-linter
+          set -euo pipefail
+          BASE="https://github.com/stackrox/kube-linter/releases/download/v${KUBE_LINTER_VERSION}"
+          TMP="$(mktemp -d)"
+          curl -sSfL -o "${TMP}/kube-linter.tar.gz" "${BASE}/kube-linter-linux.tar.gz"
+          curl -sSfL -o "${TMP}/checksums"          "${BASE}/checksums.txt"
+          ( cd "${TMP}" && grep " kube-linter-linux.tar.gz\$" checksums \
+              | sed 's/kube-linter-linux.tar.gz/kube-linter.tar.gz/' | sha256sum -c - )
+          tar -xzf "${TMP}/kube-linter.tar.gz" -C "${TMP}" kube-linter
+          sudo install -m 0755 "${TMP}/kube-linter" /usr/local/bin/kube-linter
+          rm -rf "${TMP}"
 
       # Same checks Kyverno enforces at admission — failing here means the
       # service would have been rejected at deploy time anyway.
@@ -131,10 +140,11 @@ jobs:
       service-name: payments-api
       context: lab/apps/payments-api
       push: true
-    # `secrets: inherit` is GitHub Actions syntax for passing the caller's
-    # secrets to a reusable workflow, not a credential — the detect-secrets
-    # keyword heuristic matches on the word alone.
-    secrets: inherit # pragma: allowlist secret
+    # No `secrets: inherit`. The called workflow authenticates entirely through
+    # OIDC and reads its configuration from `vars.*` — it references no secret
+    # at all, so inheriting them would hand it every credential in the
+    # repository for no reason (semgrep: secrets-inherit). If it ever needs one,
+    # pass that single secret explicitly.
 
   # ── Promote by committing a digest ─────────────────────────────────────────
   promote:
@@ -162,31 +172,47 @@ jobs:
 
           # Rewrite only the digest line; anything else in the overlay is a
           # human decision and must not be touched by automation.
-          python3 - <<PYEOF
-          import re, pathlib
-          p = pathlib.Path("${FILE}")
-          s = p.read_text()
-          new, n = re.subn(r"digest: sha256:[a-f0-9]{64}",
-                           "digest: ${DIGEST}", s)
-          if n != 1:
-              raise SystemExit(f"expected exactly one digest line, found {n}")
-          p.write_text(new)
-          print(f"Updated {p} -> ${DIGEST}")
+          #
+          # Quoted heredoc + os.environ: an unquoted heredoc would let the shell
+          # expand values into the Python source before it runs, which is the
+          # same injection class as interpolating into `run:` directly.
+          OVERLAY_FILE="$FILE" python3 - <<'PYEOF'
+          import os, pathlib, re, sys
+
+          path = pathlib.Path(os.environ["OVERLAY_FILE"])
+          digest = os.environ["DIGEST"]
+
+          # Validate before writing: a malformed digest would otherwise be
+          # committed and only fail later at image pull.
+          if not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+              sys.exit(f"refusing to write malformed digest: {digest!r}")
+
+          text = path.read_text()
+          new, count = re.subn(r"digest: sha256:[a-f0-9]{64}", f"digest: {digest}", text)
+          if count != 1:
+              sys.exit(f"expected exactly one digest line in {path}, found {count}")
+
+          path.write_text(new)
+          print(f"Updated {path} -> {digest}")
           PYEOF
 
           echo "file=${FILE}" >> "$GITHUB_OUTPUT"
 
       - name: Commit to dev directly
         if: (github.event.inputs.environment || 'dev') == 'dev'
+        env:
+          OVERLAY_FILE: ${{ steps.update.outputs.file }}
+          DIGEST:       ${{ needs.build.outputs.image-digest }}
+          IMAGE_REF:    ${{ needs.build.outputs.image-ref }}
+          SOURCE_SHA:   ${{ github.sha }}
         run: |
           git config user.name  "platform-ci[bot]"
           git config user.email "platform-ci@users.noreply.github.com"
-          git add "${{ steps.update.outputs.file }}"
+          git add "${OVERLAY_FILE}"
           git diff --staged --quiet && { echo "No change"; exit 0; }
-          git commit -m "chore(dev): promote payments-api to ${{ needs.build.outputs.image-digest }}
-
-          Image: ${{ needs.build.outputs.image-ref }}
-          Source commit: ${{ github.sha }}"
+          git commit -m "chore(dev): promote payments-api to ${DIGEST}" \
+                     -m "Image: ${IMAGE_REF}
+          Source commit: ${SOURCE_SHA}"
           git push
 
       # staging and prod get a PR: promotion to an environment customers touch
@@ -194,14 +220,16 @@ jobs:
       - name: Open a promotion PR for staging/prod
         if: (github.event.inputs.environment || 'dev') != 'dev'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          GH_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          ENVIRONMENT:  ${{ github.event.inputs.environment }}
+          OVERLAY_FILE: ${{ steps.update.outputs.file }}
+          DIGEST:       ${{ needs.build.outputs.image-digest }}
         run: |
           BRANCH="promote/${ENVIRONMENT}/payments-api-${GITHUB_SHA::7}"
           git config user.name  "platform-ci[bot]"
           git config user.email "platform-ci@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add "${{ steps.update.outputs.file }}"
+          git add "${OVERLAY_FILE}"
           git diff --staged --quiet && { echo "No change"; exit 0; }
           git commit -m "chore(${ENVIRONMENT}): promote payments-api"
           git push -u origin "$BRANCH"
@@ -215,7 +243,7 @@ jobs:
           |---|---|
           | Environment | \`${ENVIRONMENT}\` |
           | Service | payments-api |
-          | Digest | \`${{ needs.build.outputs.image-digest }}\` |
+          | Digest | \`${DIGEST}\` |
           | Source commit | ${GITHUB_SHA} |
 
           The image is signed with cosign and has an attested CycloneDX SBOM.
@@ -250,10 +278,13 @@ jobs:
       - uses: azure/setup-kubectl@v4
 
       - name: Get cluster credentials
+        env:
+          AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME:   ${{ vars.AKS_CLUSTER_NAME }}
         run: |
           az aks get-credentials \
-            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
-            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_CLUSTER_NAME}" \
             --overwrite-existing
           kubelogin convert-kubeconfig -l azurecli
 
@@ -266,6 +297,8 @@ jobs:
             --timeout=10m
 
       - name: Verify the running digest matches what we built
+        env:
+          EXPECTED_DIGEST: ${{ needs.build.outputs.image-digest }}
         run: |
           RUNNING=$(kubectl get deployment payments-api-dotnet-service \
             --namespace payments \
@@ -273,7 +306,7 @@ jobs:
           echo "Running image: ${RUNNING}"
 
           case "${RUNNING}" in
-            *"${{ needs.build.outputs.image-digest }}") echo "Digest matches." ;;
+            *"${EXPECTED_DIGEST}") echo "Digest matches." ;;
             *) echo "::error::Running digest does not match the built image"; exit 1 ;;
           esac
 

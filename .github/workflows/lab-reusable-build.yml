@@ -89,7 +89,9 @@ jobs:
       # `az acr login` mints a short-lived token from the OIDC session, so no
       # registry password exists to leak or rotate.
       - name: ACR login
-        run: az acr login --name "${{ vars.ACR_NAME }}"
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: az acr login --name "${ACR_NAME}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -127,14 +129,23 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
 
+      # Values arrive via env, never interpolated into the shell: `${{ }}` in a
+      # run block is substituted before the shell parses it, so a value with
+      # metacharacters would execute (semgrep: run-shell-injection).
       - name: Resolve image reference
         id: ref
+        env:
+          PUSH:         ${{ inputs.push }}
+          REGISTRY:     ${{ vars.ACR_REGISTRY }}
+          SERVICE_NAME: ${{ inputs.service-name }}
+          DIGEST:       ${{ steps.build-push.outputs.digest }}
+          META_TAGS:    ${{ steps.meta.outputs.tags }}
         run: |
-          if [ "${{ inputs.push }}" = "true" ]; then
-            REF="${{ vars.ACR_REGISTRY }}/${{ inputs.service-name }}@${{ steps.build-push.outputs.digest }}"
+          if [ "${PUSH}" = "true" ]; then
+            REF="${REGISTRY}/${SERVICE_NAME}@${DIGEST}"
           else
             # Not pushed, so scan the local tag instead of a digest.
-            REF=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+            REF=$(printf '%s' "${META_TAGS}" | head -1)
           fi
           echo "image_ref=${REF}" >> "$GITHUB_OUTPUT"
           echo "Image reference: ${REF}"
@@ -155,10 +166,14 @@ jobs:
       # check blocked on HIGH findings that policy says should only warn.
       - name: Enforce CVSS thresholds
         id: gate
+        env:
+          SERVICE_NAME:  ${{ inputs.service-name }}
+          SEVERITY_GATE: ${{ inputs.severity-gate }}
         run: |
+          EXTRA=()
+          [ "${SEVERITY_GATE}" = "HIGH" ] && EXTRA+=("--fail-on-high")
           python3 .github/scripts/cvss_gate.py trivy-image.sarif \
-            --tool "${{ inputs.service-name }} image" \
-            ${{ inputs.severity-gate == 'HIGH' && '--fail-on-high' || '' }}
+            --tool "${SERVICE_NAME} image" "${EXTRA[@]}"
 
       - name: Upload Trivy SARIF
         if: always() && hashFiles('trivy-image.sarif') != ''
@@ -176,26 +191,45 @@ jobs:
 
       - name: Sign image (keyless, Sigstore transparency log)
         if: inputs.push
+        env:
+          IMAGE_REF: ${{ steps.ref.outputs.image_ref }}
         run: |
           cosign sign --yes \
             --rekor-url https://rekor.sigstore.dev \
-            "${{ steps.ref.outputs.image_ref }}"
+            "${IMAGE_REF}"
 
       - name: Generate and attest SBOM
         if: inputs.push
+        env:
+          IMAGE_REF:     ${{ steps.ref.outputs.image_ref }}
+          SERVICE_NAME:  ${{ inputs.service-name }}
+          SYFT_VERSION:  "1.18.1"
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
-            sudo sh -s -- -b /usr/local/bin v1.18.1
+          set -euo pipefail
 
-          syft "${{ steps.ref.outputs.image_ref }}" \
-            -o cyclonedx-json="sbom-${{ inputs.service-name }}.json"
+          # Checksum-verified release asset rather than `curl | sudo sh`
+          # (semgrep: gha-curl-pipe-shell): the SBOM generator is part of the
+          # supply chain it attests to, so it gets the same scrutiny.
+          TMP="$(mktemp -d)"
+          BASE="https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}"
+          TARBALL="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+
+          curl -sSfL -o "${TMP}/${TARBALL}" "${BASE}/${TARBALL}"
+          curl -sSfL -o "${TMP}/checksums.txt" "${BASE}/syft_${SYFT_VERSION}_checksums.txt"
+          ( cd "${TMP}" && grep " ${TARBALL}\$" checksums.txt | sha256sum -c - )
+
+          tar -xzf "${TMP}/${TARBALL}" -C "${TMP}" syft
+          sudo install -m 0755 "${TMP}/syft" /usr/local/bin/syft
+          rm -rf "${TMP}"
+
+          syft "${IMAGE_REF}" -o "cyclonedx-json=sbom-${SERVICE_NAME}.json"
 
           # The attestation binds the SBOM to the digest in the transparency
           # log, so "what is in this image" is answerable after the fact.
           cosign attest --yes \
-            --predicate "sbom-${{ inputs.service-name }}.json" \
+            --predicate "sbom-${SERVICE_NAME}.json" \
             --type cyclonedx \
-            "${{ steps.ref.outputs.image_ref }}"
+            "${IMAGE_REF}"
 
       - name: Upload SBOM artifact
         if: inputs.push
