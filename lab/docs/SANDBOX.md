@@ -13,7 +13,9 @@ Measured on the target subscription, not assumed:
 
 | | |
 |---|---|
-| Agreement | Microsoft Customer Agreement — **charges are real**, not a capped trial |
+| Subscription offer | **`FreeTrial_2014-09-01`** — an Azure free trial, not pay-as-you-go |
+| Spending limit | **On** — Azure disables resources rather than charging when the credit is gone |
+| Billing account type | MicrosoftCustomerAgreement (the *account* type; it does not imply the subscription bills) |
 | Region | swedencentral |
 | **Total regional vCPU quota** | **4** |
 | Per-family vCPU quota | 4 (D, B, E, F families all capped at 4) |
@@ -131,9 +133,28 @@ cost more than the environment it tracks. Every other environment uses the
 | AKS control plane (Free tier) | — | €0 |
 | **Total** | | **~€86/month, or ~€2.90/day** |
 
-A budget alert at €50 with notifications at 50%, 80% and forecast 100% is
-created as part of the environment. It does not stop spending — Azure budgets
-alert, they do not enforce — so **destroy the environment when you are done**.
+### What the spending limit actually means
+
+This subscription carries `spendingLimit: On`, so **it cannot generate an
+invoice**. When the free-trial credit is exhausted — or the 30-day trial window
+closes — Azure *disables the subscription* instead of charging: compute is
+deallocated and resources stop responding. Data is retained for a grace period
+and then deleted.
+
+So the cost above is denominated in **free credit, not money**. That changes the
+urgency but not the conclusion:
+
+- Nothing here will produce a bill while the spending limit is on.
+- The credit is finite and is the scarce resource for any future experiment.
+- An environment left running is switched off at the trial boundary anyway, so
+  leaving it up buys nothing.
+
+The budget alert at €50 still fires at 50%, 80% and forecast 100%, which is
+useful as an early warning on credit burn. Azure budgets alert, they do not
+enforce — the spending limit is what enforces.
+
+**Destroy the environment when you are done with it.** Re-creating takes about
+fifteen minutes.
 
 Scaling to the pool minimum of 1 node halves the compute cost if you want the
 cluster up but idle — though note that the AKS addons then do not all fit, so

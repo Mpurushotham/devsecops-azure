@@ -206,7 +206,8 @@ permanently accepted vulnerability that nobody remembers accepting.
 
 Stated plainly, so the gaps are visible rather than discovered:
 
-- **Only `sandbox` has been applied to a real subscription.** It is live: 61
+- **Only `sandbox` has been applied to a real subscription** (an Azure free
+  trial with the spending limit on, so it consumes credit rather than money). It is live: 61
   resources, a working cluster, the app deployed and serving. dev/staging/prod
   remain unapplied and their costs are estimates. See
   [SANDBOX.md](docs/SANDBOX.md) — that exercise found **nine** defects across
