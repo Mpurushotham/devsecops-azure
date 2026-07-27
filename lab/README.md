@@ -38,6 +38,7 @@ rules are reused rather than forked; nothing here modifies it.
 | [MIGRATION-DOTNET.md](docs/MIGRATION-DOTNET.md) | Legacy .NET Framework VMs → containerised .NET 10 on AKS |
 | [SANDBOX.md](docs/SANDBOX.md) | Deploying to a real, quota-constrained subscription |
 | [architecture-view.html](docs/architecture-view.html) | Single-page architecture and deployment record — diagrams, live evidence, defect log |
+| [AZURE-DEVOPS.md](docs/AZURE-DEVOPS.md) | ADO pipeline: what is wired, and the parallelism grant that blocks it |
 | [COVERAGE.md](docs/COVERAGE.md) | What is **proven** on live Azure vs **coded** vs **absent**, against the role |
 | [INTERVIEW-NOTES.md](docs/INTERVIEW-NOTES.md) | Defending the design: what, why, what it cost, what would change it |
 

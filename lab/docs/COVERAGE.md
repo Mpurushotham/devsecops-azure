@@ -34,11 +34,18 @@ lint, tests, SAST (Semgrep, Bandit), SCA, secret scanning (gitleaks,
 TruffleHog), SBOM, licence policy, IaC scan, Helm contract assertions.
 A reusable build/sign workflow and a Terraform plan/apply workflow.
 
-**Azure DevOps: coded.** `lab/azure-pipelines/terraform-pipeline.yml` mirrors
-the GitHub workflow step for step — same Terraform version, same gates, same
-CVSS policy. It has never executed; there is no ADO organisation attached to
-this subscription. Written deliberately as a mirror ([ADR-016](DECISIONS.md#adr-016))
-so a service can move between CI platforms without its security posture changing.
+**Azure DevOps: wired, blocked on an account grant.** The pipeline exists in
+`ADODemotests/DevOps-Demo`, compiles cleanly, and resolves a **workload identity
+federation** service connection — no client secret, the same model as the GitHub
+OIDC path. Sandbox state was migrated to Azure Blob so a pipeline can operate it.
+
+It has not produced a green run: new ADO organisations no longer receive the
+free hosted-agent grant, so jobs are scheduled and then fail with *"No hosted
+parallelism has been purchased or granted"*. That is an account-level grant, not
+a defect — and the run history shows it: the first attempt failed YAML
+*validation*, the second compiled and failed only at agent allocation.
+Unblocking is a form (2–3 days) or a self-hosted agent. See
+[AZURE-DEVOPS.md](AZURE-DEVOPS.md).
 
 ### 3. GitOps across dev, staging, production
 
@@ -167,7 +174,7 @@ locally with the same command.
 | Kubernetes, orchestration, Helm | **Proven** — chart deployed twice, once by hand and once by Argo CD |
 | IaC with Terraform | **Proven** — 5 modules, 4 environments, applied |
 | CI/CD: GitHub Actions | **Proven** |
-| CI/CD: Azure DevOps | **Coded** |
+| CI/CD: Azure DevOps | **Wired** — compiles, federated connection resolves; blocked on hosted parallelism |
 | Observability: logging, metrics, alerting | **Partly proven** — see §4 |
 | Observability: distributed tracing | **Coded** |
 | Incident management | **Coded** — runbooks, no incident rehearsed |
@@ -189,7 +196,8 @@ than shown:
    evidence.
 3. **Install KEDA and drive the RabbitMQ queue** until it scales. The queue and
    the trigger config both exist; only the operator is missing.
-4. **Run the Azure DevOps pipeline** against a real ADO project.
+4. **Get an agent for the Azure DevOps pipeline** — the form, or a self-hosted
+   agent. Everything else on that side is done.
 5. **Load-test the seasonal-spike path** — the autoscaler tuning in ADR-007 is
    reasoned, not measured.
 
