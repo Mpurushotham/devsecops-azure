@@ -8,8 +8,10 @@ variable "environment" {
   type        = string
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: dev, staging, prod."
+    # "sandbox" is the quota-constrained shape used to exercise the modules
+    # against a free-tier subscription; it behaves like dev but smaller.
+    condition     = contains(["sandbox", "dev", "staging", "prod"], var.environment)
+    error_message = "environment must be one of: sandbox, dev, staging, prod."
   }
 }
 
@@ -117,4 +119,34 @@ variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
   default     = {}
+}
+
+variable "acr_sku" {
+  description = "Override the ACR SKU (Basic, Standard, Premium). Empty derives it from the environment."
+  type        = string
+  default     = ""
+}
+
+variable "key_vault_sku" {
+  description = "Override the Key Vault SKU (standard, premium). Empty derives it from the environment."
+  type        = string
+  default     = ""
+}
+
+variable "enable_csi_driver_access" {
+  description = "Grant the AKS Key Vault CSI identity read access to the vault."
+  type        = bool
+  default     = true
+}
+
+variable "enable_github_aks_reader" {
+  description = "Grant the GitHub deploy identity Cluster User on the AKS cluster."
+  type        = bool
+  default     = true
+}
+
+variable "enable_diagnostics" {
+  description = "Send Key Vault and ACR diagnostics to log_analytics_workspace_id."
+  type        = bool
+  default     = true
 }

@@ -36,6 +36,7 @@ rules are reused rather than forked; nothing here modifies it.
 | [DECISIONS.md](docs/DECISIONS.md) | 17 ADRs — what was chosen, what it costs, what would change it |
 | [RUNBOOKS.md](docs/RUNBOOKS.md) | Incident response, written for 03:00 |
 | [MIGRATION-DOTNET.md](docs/MIGRATION-DOTNET.md) | Legacy .NET Framework VMs → containerised .NET 10 on AKS |
+| [SANDBOX.md](docs/SANDBOX.md) | Deploying to a real, quota-constrained subscription |
 
 ---
 
@@ -131,6 +132,11 @@ make output ENV=prod
 make chart-policy           # assert the security contract on rendered manifests
 make app-build && make app-scan
 make destroy ENV=dev        # blocked for prod, deliberately
+
+# Sandbox on a real subscription
+make sandbox-quota          # check vCPU headroom before spending time
+make sandbox-tfvars         # generate tfvars from the current az login
+make sandbox-cost           # month-to-date spend
 ```
 
 Every one of these runs in CI too. A check that exists only in the pipeline gets
@@ -141,21 +147,22 @@ same targets.
 
 ## Environment shapes
 
-Same architecture in all three; capacity and exposure differ, and every
-difference is deliberate.
+Same architecture in all four; capacity and exposure differ, and every
+difference is deliberate. `sandbox` is the shape that fits a free-tier
+subscription's 4 vCPU quota — see [SANDBOX.md](docs/SANDBOX.md).
 
-| | dev | staging | prod |
-|---|---|---|---|
-| API server | Public, CIDR-restricted | Public, CIDR-restricted | **Private** |
-| Zones | 1 | 1 | 3 |
-| App nodes | 1–8 × D4 | 2–8 × D4 | 5–30 × D8 |
-| Spot pool | — | — | Yes (batch) |
-| Windows pool | — | — | Yes (migration) |
-| SQL | GP serverless (auto-pause) | GP serverless | **BC_Gen5_8**, zone-redundant, read-scale |
-| Private endpoints | — | — | SQL, Key Vault, ACR, Blob |
-| Log retention | 30d, 2GB/day cap | 30d, 5GB/day cap | 180d, uncapped |
-| Alerting | None | Tickets only | Pages on-call |
-| Promotion | Auto-commit | PR + review | PR + review + environment approval |
+| | sandbox | dev | staging | prod |
+|---|---|---|---|---|
+| API server | Public, CIDR-restricted | Public, CIDR-restricted | Public, CIDR-restricted | **Private** |
+| Zones | none | 1 | 1 | 3 |
+| Nodes | 1–2 × B2s (single pool) | 1–8 × D4 | 2–8 × D4 | 5–30 × D8 |
+| Spot pool | — | — | — | Yes (batch) |
+| Windows pool | — | — | — | Yes (migration) |
+| SQL | off by default | GP serverless (auto-pause) | GP serverless | **BC_Gen5_8**, zone-redundant, read-scale |
+| Private endpoints | — | — | — | SQL, Key Vault, ACR, Blob |
+| Log retention | 30d, 0.5GB/day cap | 30d, 2GB/day cap | 30d, 5GB/day cap | 180d, uncapped |
+| Alerting | None | None | Tickets only | Pages on-call |
+| Promotion | Manual | Auto-commit | PR + review | PR + review + environment approval |
 
 Dev and staging keep public API endpoints because the alternative — a
 self-hosted runner fleet per environment — costs more than it protects for
@@ -172,7 +179,7 @@ Everything in this lab has been checked locally, not just written:
 
 | Check | Result |
 |---|---|
-| `terraform validate` — 5 modules, 3 envs, bootstrap | Pass |
+| `terraform validate` — 5 modules, 4 envs, bootstrap | Pass |
 | `terraform fmt -check -recursive` | Pass |
 | `tflint` — all modules and environments | Pass, 0 issues |
 | `trivy config` — all environments | 0 CRITICAL / 0 HIGH |
@@ -180,6 +187,8 @@ Everything in this lab has been checked locally, not just written:
 | Security contract assertions on rendered output | 17/17 pass |
 | `trivy image` on the reference app | 0 CRITICAL / 0 HIGH |
 | Container starts under a read-only rootfs as uid 10001 | Pass, no errors logged |
+| **`terraform plan` against a live subscription** (`sandbox`) | **Pass — 58 resources, 0 destroy** |
+| Security controls asserted on that plan | 19/19 preserved |
 
 The one Trivy exception is recorded in `.trivyignore.yaml` with a justification
 and an expiry date, because a suppression without a review date becomes a
@@ -191,8 +200,11 @@ permanently accepted vulnerability that nobody remembers accepting.
 
 Stated plainly, so the gaps are visible rather than discovered:
 
-- **No live Azure deployment.** Everything validates and scans clean, but it has
-  not been applied against a real subscription. Costs are estimates.
+- **Only `sandbox` has been planned against a real subscription.** The plan
+  succeeds and creates 58 resources; dev/staging/prod remain unapplied, and
+  their costs are estimates. See [SANDBOX.md](docs/SANDBOX.md) — that exercise
+  found a `count`-on-computed-value defect affecting all four environments that
+  `terraform validate` could not catch.
 - **RabbitMQ is referenced, not provisioned.** KEDA triggers and network policy
   ports are in place; the cluster itself would be installed via the RabbitMQ
   Cluster Operator in a follow-up.

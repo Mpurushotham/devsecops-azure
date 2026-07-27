@@ -8,8 +8,10 @@ variable "environment" {
   type        = string
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: dev, staging, prod."
+    # "sandbox" is the quota-constrained shape used to exercise the modules
+    # against a free-tier subscription; it behaves like dev but smaller.
+    condition     = contains(["sandbox", "dev", "staging", "prod"], var.environment)
+    error_message = "environment must be one of: sandbox, dev, staging, prod."
   }
 }
 
@@ -86,4 +88,25 @@ variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
   default     = {}
+}
+
+variable "enable_nat_gateway" {
+  description = <<-EOT
+    Provision a NAT gateway for deterministic, allowlistable egress (ADR-003).
+    It carries an hourly charge plus data processing, so it can be disabled for
+    a sandbox — at the cost of losing the static egress IP. The AKS module's
+    outbound_type must be set to loadBalancer to match.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "enable_private_dns_zones" {
+  description = <<-EOT
+    Create the private DNS zones used for private-endpoint resolution. Only
+    needed where private endpoints are actually deployed; each zone carries a
+    small monthly charge.
+  EOT
+  type        = bool
+  default     = true
 }

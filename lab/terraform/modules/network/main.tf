@@ -87,16 +87,20 @@ resource "azurerm_subnet" "data" {
 # outbound uses ephemeral LB IPs that change on scale events — a static NAT
 # egress IP is a hard requirement for that integration (ADR-003).
 resource "azurerm_public_ip" "nat" {
+  count = var.enable_nat_gateway ? 1 : 0
+
   name                = "pip-nat-${local.name_prefix}"
   location            = azurerm_resource_group.network.location
   resource_group_name = azurerm_resource_group.network.name
   allocation_method   = "Static"
   sku                 = "Standard"
-  zones               = var.availability_zones
+  zones               = length(var.availability_zones) > 0 ? var.availability_zones : null
   tags                = local.common_tags
 }
 
 resource "azurerm_nat_gateway" "egress" {
+  count = var.enable_nat_gateway ? 1 : 0
+
   name                    = "natgw-${local.name_prefix}"
   location                = azurerm_resource_group.network.location
   resource_group_name     = azurerm_resource_group.network.name
@@ -106,18 +110,24 @@ resource "azurerm_nat_gateway" "egress" {
 }
 
 resource "azurerm_nat_gateway_public_ip_association" "egress" {
-  nat_gateway_id       = azurerm_nat_gateway.egress.id
-  public_ip_address_id = azurerm_public_ip.nat.id
+  count = var.enable_nat_gateway ? 1 : 0
+
+  nat_gateway_id       = azurerm_nat_gateway.egress[0].id
+  public_ip_address_id = azurerm_public_ip.nat[0].id
 }
 
 resource "azurerm_subnet_nat_gateway_association" "apps" {
+  count = var.enable_nat_gateway ? 1 : 0
+
   subnet_id      = azurerm_subnet.apps.id
-  nat_gateway_id = azurerm_nat_gateway.egress.id
+  nat_gateway_id = azurerm_nat_gateway.egress[0].id
 }
 
 resource "azurerm_subnet_nat_gateway_association" "system" {
+  count = var.enable_nat_gateway ? 1 : 0
+
   subnet_id      = azurerm_subnet.system.id
-  nat_gateway_id = azurerm_nat_gateway.egress.id
+  nat_gateway_id = azurerm_nat_gateway.egress[0].id
 }
 
 # ── NSGs: deny-by-default, explicit allows ───────────────────────────────────
@@ -296,7 +306,7 @@ resource "azurerm_subnet_network_security_group_association" "data" {
 
 # ── Private DNS ──────────────────────────────────────────────────────────────
 resource "azurerm_private_dns_zone" "this" {
-  for_each = local.private_dns_zones
+  for_each = var.enable_private_dns_zones ? local.private_dns_zones : {}
 
   name                = each.value
   resource_group_name = azurerm_resource_group.network.name
@@ -304,7 +314,7 @@ resource "azurerm_private_dns_zone" "this" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "this" {
-  for_each = local.private_dns_zones
+  for_each = var.enable_private_dns_zones ? local.private_dns_zones : {}
 
   name                  = "link-${each.key}-${local.name_prefix}"
   resource_group_name   = azurerm_resource_group.network.name

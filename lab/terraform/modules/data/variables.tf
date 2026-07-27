@@ -8,8 +8,10 @@ variable "environment" {
   type        = string
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: dev, staging, prod."
+    # "sandbox" is the quota-constrained shape used to exercise the modules
+    # against a free-tier subscription; it behaves like dev but smaller.
+    condition     = contains(["sandbox", "dev", "staging", "prod"], var.environment)
+    error_message = "environment must be one of: sandbox, dev, staging, prod."
   }
 }
 
@@ -75,11 +77,13 @@ variable "max_size_gb" {
 variable "sql_admin_group_name" {
   description = "Display name of the Entra ID group that administers SQL."
   type        = string
+  default     = ""
 }
 
 variable "sql_admin_group_object_id" {
-  description = "Object ID of the Entra ID group that administers SQL."
+  description = "Object ID of the Entra ID group that administers SQL. Also accepts a user object ID in a sandbox."
   type        = string
+  default     = ""
 }
 
 variable "tde_key_vault_key_id" {
@@ -125,4 +129,26 @@ variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
   default     = {}
+}
+
+variable "enable_sql" {
+  description = <<-EOT
+    Provision the Azure SQL server and database. Disabling it leaves the
+    platform storage account, which is enough to exercise the rest of the
+    platform without paying for a database.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "enable_private_endpoints" {
+  description = "Create private endpoints for storage. Each endpoint carries an hourly charge."
+  type        = bool
+  default     = true
+}
+
+variable "enable_diagnostics" {
+  description = "Send SQL auditing and diagnostics to log_analytics_workspace_id."
+  type        = bool
+  default     = true
 }

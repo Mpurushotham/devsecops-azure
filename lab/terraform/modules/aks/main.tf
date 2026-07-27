@@ -23,7 +23,12 @@ locals {
   })
 
   # Production runs across all three zones; dev collapses to one to save cost.
-  zones = var.environment == "prod" ? ["1", "2", "3"] : ["1"]
+  # An empty list disables zone pinning entirely, which is required for VM
+  # families (B-series) and quota-constrained subscriptions that cannot place
+  # a node in a specific zone.
+  zones = var.availability_zones != null ? var.availability_zones : (
+    var.environment == "prod" ? ["1", "2", "3"] : ["1"]
+  )
 }
 
 resource "azurerm_resource_group" "aks" {
@@ -63,7 +68,7 @@ resource "azurerm_role_assignment" "cluster_network_contributor" {
 }
 
 resource "azurerm_role_assignment" "kubelet_acr_pull" {
-  count = var.acr_id == "" ? 0 : 1
+  count = var.enable_acr_pull_assignment ? 1 : 0
 
   scope                = var.acr_id
   role_definition_name = "AcrPull"
@@ -137,17 +142,21 @@ resource "azurerm_kubernetes_cluster" "main" {
   }
 
   default_node_pool {
-    name                         = "system"
-    vm_size                      = var.system_pool_vm_size
-    vnet_subnet_id               = var.system_subnet_id
-    zones                        = local.zones
-    auto_scaling_enabled         = true
-    min_count                    = var.system_pool_min_count
-    max_count                    = var.system_pool_max_count
-    max_pods                     = 60
-    os_disk_type                 = "Ephemeral"
-    os_disk_size_gb              = 128
-    only_critical_addons_enabled = true # taints the pool: platform components only
+    name                 = "system"
+    vm_size              = var.system_pool_vm_size
+    vnet_subnet_id       = var.system_subnet_id
+    zones                = length(local.zones) > 0 ? local.zones : null
+    auto_scaling_enabled = true
+    min_count            = var.system_pool_min_count
+    max_count            = var.system_pool_max_count
+    max_pods             = 60
+    # Ephemeral OS disks need a VM cache at least as large as the disk, which
+    # small burstable sizes do not have — hence configurable rather than fixed.
+    os_disk_type    = var.system_pool_os_disk_type
+    os_disk_size_gb = var.system_pool_os_disk_size_gb
+    # Tainting the system pool is right when there is a separate app pool. On a
+    # single-pool cluster it would leave nothing able to schedule workloads.
+    only_critical_addons_enabled = var.enable_app_pool
     temporary_name_for_rotation  = "systemtmp"
 
     upgrade_settings {
@@ -165,8 +174,10 @@ resource "azurerm_kubernetes_cluster" "main" {
     pod_cidr            = var.pod_cidr
     service_cidr        = var.service_cidr
     dns_service_ip      = cidrhost(var.service_cidr, 10)
-    outbound_type       = "userAssignedNATGateway"
-    load_balancer_sku   = "standard"
+    # Must match the network module: selecting userAssignedNATGateway without a
+    # NAT gateway attached to the subnet fails at create time.
+    outbound_type     = var.outbound_type
+    load_balancer_sku = "standard"
   }
 
   # Entra ID groups are the only way in; no cluster-admin certificates issued.
@@ -195,8 +206,13 @@ resource "azurerm_kubernetes_cluster" "main" {
     labels_allowed      = null
   }
 
-  microsoft_defender {
-    log_analytics_workspace_id = var.log_analytics_workspace_id
+  # Defender for Containers bills per vCPU per hour; off by default outside
+  # production so a sandbox does not accrue an unexpected line item.
+  dynamic "microsoft_defender" {
+    for_each = var.enable_defender ? [1] : []
+    content {
+      log_analytics_workspace_id = var.log_analytics_workspace_id
+    }
   }
 
   auto_scaler_profile {
@@ -236,17 +252,19 @@ resource "azurerm_kubernetes_cluster" "main" {
 
 # ── Application node pool ────────────────────────────────────────────────────
 resource "azurerm_kubernetes_cluster_node_pool" "apps" {
+  count = var.enable_app_pool ? 1 : 0
+
   name                  = "apps"
   kubernetes_cluster_id = azurerm_kubernetes_cluster.main.id
   vm_size               = var.app_pool_vm_size
   vnet_subnet_id        = var.apps_subnet_id
-  zones                 = local.zones
+  zones                 = length(local.zones) > 0 ? local.zones : null
   auto_scaling_enabled  = true
   min_count             = var.app_pool_min_count
   max_count             = var.app_pool_max_count
   max_pods              = 110
-  os_disk_type          = "Ephemeral"
-  os_disk_size_gb       = 256
+  os_disk_type          = var.app_pool_os_disk_type
+  os_disk_size_gb       = var.app_pool_os_disk_size_gb
   mode                  = "User"
 
   node_labels = {
@@ -275,7 +293,7 @@ resource "azurerm_kubernetes_cluster_node_pool" "spot" {
   kubernetes_cluster_id = azurerm_kubernetes_cluster.main.id
   vm_size               = var.spot_pool_vm_size
   vnet_subnet_id        = var.apps_subnet_id
-  zones                 = local.zones
+  zones                 = length(local.zones) > 0 ? local.zones : null
   auto_scaling_enabled  = true
   min_count             = 0
   max_count             = var.spot_pool_max_count
@@ -310,7 +328,7 @@ resource "azurerm_kubernetes_cluster_node_pool" "windows" {
   kubernetes_cluster_id = azurerm_kubernetes_cluster.main.id
   vm_size               = var.windows_pool_vm_size
   vnet_subnet_id        = var.apps_subnet_id
-  zones                 = local.zones
+  zones                 = length(local.zones) > 0 ? local.zones : null
   auto_scaling_enabled  = true
   min_count             = var.windows_pool_min_count
   max_count             = var.windows_pool_max_count

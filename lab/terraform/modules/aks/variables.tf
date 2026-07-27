@@ -8,8 +8,10 @@ variable "environment" {
   type        = string
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: dev, staging, prod."
+    # "sandbox" is the quota-constrained shape used to exercise the modules
+    # against a free-tier subscription; it behaves like dev but smaller.
+    condition     = contains(["sandbox", "dev", "staging", "prod"], var.environment)
+    error_message = "environment must be one of: sandbox, dev, staging, prod."
   }
 }
 
@@ -180,4 +182,84 @@ variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
   default     = {}
+}
+
+# ── Cost / quota controls ────────────────────────────────────────────────────
+# These exist so the same modules can target a quota-constrained subscription
+# (a 4 vCPU free-tier account) as well as a production landing zone. The
+# defaults keep production behaviour unchanged.
+
+variable "availability_zones" {
+  description = <<-EOT
+    Explicit zone list for node pools. null keeps the environment default
+    (3 zones in prod, 1 elsewhere); an empty list disables zone pinning, which
+    burstable VM families and constrained subscriptions require.
+  EOT
+  type        = list(string)
+  default     = null
+}
+
+variable "enable_app_pool" {
+  description = <<-EOT
+    Create the dedicated application node pool. When false the cluster runs a
+    single pool and the system pool is left untainted, since otherwise nothing
+    could schedule. Set false only where vCPU quota cannot fit two pools.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "outbound_type" {
+  description = <<-EOT
+    Cluster egress mode. Must agree with the network module: selecting
+    userAssignedNATGateway without a NAT gateway on the subnet fails at create
+    time. loadBalancer gives ephemeral egress IPs and no NAT gateway charge.
+  EOT
+  type        = string
+  default     = "userAssignedNATGateway"
+
+  validation {
+    condition     = contains(["userAssignedNATGateway", "loadBalancer", "userDefinedRouting"], var.outbound_type)
+    error_message = "outbound_type must be userAssignedNATGateway, loadBalancer or userDefinedRouting."
+  }
+}
+
+variable "system_pool_os_disk_type" {
+  description = "Ephemeral or Managed. Ephemeral needs a VM cache at least as large as the OS disk."
+  type        = string
+  default     = "Ephemeral"
+}
+
+variable "system_pool_os_disk_size_gb" {
+  description = "System node OS disk size."
+  type        = number
+  default     = 128
+}
+
+variable "app_pool_os_disk_type" {
+  description = "Ephemeral or Managed for the application pool."
+  type        = string
+  default     = "Ephemeral"
+}
+
+variable "app_pool_os_disk_size_gb" {
+  description = "Application node OS disk size."
+  type        = number
+  default     = 256
+}
+
+variable "enable_defender" {
+  description = "Enable Microsoft Defender for Containers. Bills per vCPU-hour, so off outside production."
+  type        = bool
+  default     = false
+}
+
+variable "enable_acr_pull_assignment" {
+  description = <<-EOT
+    Grant AcrPull on acr_id to the kubelet identity. A separate boolean rather
+    than deriving from acr_id, because acr_id is usually computed by another
+    module in the same apply and Terraform cannot evaluate count against it.
+  EOT
+  type        = bool
+  default     = false
 }
