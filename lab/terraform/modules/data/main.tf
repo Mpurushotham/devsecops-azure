@@ -18,6 +18,13 @@ locals {
   })
 
   is_prod = var.environment == "prod"
+
+  # Azure storage and Key Vault network ACLs reject a /32 suffix — a single
+  # address must be given bare. Callers pass ordinary CIDRs, so normalise here
+  # rather than making every environment remember the quirk. Only apply/plan
+  # against the real API surfaces this; the schema accepts /32 happily.
+  allowed_ips = [for c in var.allowed_ip_ranges : replace(c, "/32", "")]
+
 }
 
 resource "azurerm_resource_group" "data" {
@@ -226,7 +233,7 @@ resource "azurerm_storage_account" "platform" {
     default_action             = "Deny"
     bypass                     = ["AzureServices", "Logging", "Metrics"]
     virtual_network_subnet_ids = [var.apps_subnet_id]
-    ip_rules                   = var.allowed_ip_ranges
+    ip_rules                   = local.allowed_ips
   }
 
   identity {

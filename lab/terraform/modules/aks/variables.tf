@@ -21,9 +21,15 @@ variable "location" {
 }
 
 variable "kubernetes_version" {
-  description = "AKS minor version. Patch drift is handled by the auto-upgrade channel."
+  description = <<-EOT
+    AKS minor version. Patch drift is handled by the auto-upgrade channel.
+    Versions that have left mainstream support are rejected at create time with
+    K8sVersionNotSupported unless the cluster opts into LTS, so this tracks a
+    version with KubernetesOfficial support — check with:
+      az aks get-versions --location <region> -o table
+  EOT
   type        = string
-  default     = "1.31"
+  default     = "1.34"
 }
 
 variable "tenant_id" {

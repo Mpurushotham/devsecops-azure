@@ -37,6 +37,7 @@ rules are reused rather than forked; nothing here modifies it.
 | [RUNBOOKS.md](docs/RUNBOOKS.md) | Incident response, written for 03:00 |
 | [MIGRATION-DOTNET.md](docs/MIGRATION-DOTNET.md) | Legacy .NET Framework VMs → containerised .NET 10 on AKS |
 | [SANDBOX.md](docs/SANDBOX.md) | Deploying to a real, quota-constrained subscription |
+| [architecture-view.html](docs/architecture-view.html) | Single-page architecture and deployment record — diagrams, live evidence, defect log |
 
 ---
 
@@ -187,8 +188,9 @@ Everything in this lab has been checked locally, not just written:
 | Security contract assertions on rendered output | 17/17 pass |
 | `trivy image` on the reference app | 0 CRITICAL / 0 HIGH |
 | Container starts under a read-only rootfs as uid 10001 | Pass, no errors logged |
-| **`terraform plan` against a live subscription** (`sandbox`) | **Pass — 58 resources, 0 destroy** |
-| Security controls asserted on that plan | 19/19 preserved |
+| **`terraform apply` against a live subscription** (`sandbox`) | **Applied — 61 resources, AKS 1.34.9** |
+| Security controls asserted on the running pod | 16/16 preserved |
+| Reference app deployed via Helm and serving | Pass — `/healthz`, `/readyz`, headers intact |
 
 The one Trivy exception is recorded in `.trivyignore.yaml` with a justification
 and an expiry date, because a suppression without a review date becomes a
@@ -200,11 +202,12 @@ permanently accepted vulnerability that nobody remembers accepting.
 
 Stated plainly, so the gaps are visible rather than discovered:
 
-- **Only `sandbox` has been planned against a real subscription.** The plan
-  succeeds and creates 58 resources; dev/staging/prod remain unapplied, and
-  their costs are estimates. See [SANDBOX.md](docs/SANDBOX.md) — that exercise
-  found a `count`-on-computed-value defect affecting all four environments that
-  `terraform validate` could not catch.
+- **Only `sandbox` has been applied to a real subscription.** It is live: 61
+  resources, a working cluster, the app deployed and serving. dev/staging/prod
+  remain unapplied and their costs are estimates. See
+  [SANDBOX.md](docs/SANDBOX.md) — that exercise found **nine** defects across
+  three waves (graph, Azure API, running workload), every one of which
+  `terraform validate` had been passing cleanly.
 - **RabbitMQ is referenced, not provisioned.** KEDA triggers and network policy
   ports are in place; the cluster itself would be installed via the RabbitMQ
   Cluster Operator in a follow-up.

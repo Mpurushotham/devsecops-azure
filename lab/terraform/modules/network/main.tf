@@ -62,6 +62,8 @@ resource "azurerm_subnet" "system" {
   resource_group_name  = azurerm_resource_group.network.name
   virtual_network_name = azurerm_virtual_network.spoke.name
   address_prefixes     = [cidrsubnet(var.vnet_cidr, 4, 1)]
+
+  service_endpoints = var.subnet_service_endpoints
 }
 
 # Sized /20 out of the spoke: Azure CNI overlay assigns pod IPs from a separate
@@ -71,6 +73,11 @@ resource "azurerm_subnet" "apps" {
   resource_group_name  = azurerm_resource_group.network.name
   virtual_network_name = azurerm_virtual_network.spoke.name
   address_prefixes     = [cidrsubnet(var.vnet_cidr, 2, 1)]
+
+  # Required before this subnet can appear in a PaaS resource's network ACL.
+  # Without them Azure rejects the ACL with SubnetsHaveNoServiceEndpointsConfigured
+  # — a failure that appears only at apply, never at plan.
+  service_endpoints = var.subnet_service_endpoints
 }
 
 resource "azurerm_subnet" "data" {

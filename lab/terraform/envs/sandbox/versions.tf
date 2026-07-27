@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/azurerm"
       version = "~> 4.14"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 
   # Local state on purpose. The sandbox exists to be created and destroyed on a
@@ -17,6 +21,12 @@ terraform {
 provider "azurerm" {
   subscription_id = var.subscription_id
   tenant_id       = var.tenant_id
+
+  # The platform storage account sets shared_access_key_enabled = false, so the
+  # provider's own data-plane calls must authenticate with Entra too. Without
+  # this the apply fails with KeyBasedAuthenticationNotPermitted while polling
+  # the blob service — the provider trying to use a key the account rejects.
+  storage_use_azuread = true
 
   features {
     key_vault {

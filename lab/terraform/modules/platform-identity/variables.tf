@@ -150,3 +150,24 @@ variable "enable_diagnostics" {
   type        = bool
   default     = true
 }
+
+variable "rbac_propagation_seconds" {
+  description = <<-EOT
+    How long to wait after creating Key Vault role assignments before dependent
+    resources write to the vault. Entra RBAC is eventually consistent and the
+    data plane returns 403 until it converges. Zero disables the wait.
+  EOT
+  type        = number
+  default     = 60
+}
+
+variable "kubelet_identity_principal_id" {
+  description = <<-EOT
+    Principal ID of the AKS kubelet identity, granted AcrPull on this registry.
+    Empty skips the assignment. This is a plain input rather than a lookup so
+    the dependency stays one-directional: AKS is created first, then this module
+    grants the cluster access to the registry it creates.
+  EOT
+  type        = string
+  default     = ""
+}

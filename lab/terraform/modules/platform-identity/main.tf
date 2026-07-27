@@ -26,6 +26,13 @@ locals {
   kv_name = substr(replace("kv-${local.name_prefix}-${var.unique_suffix}", "_", "-"), 0, 24)
   # ACR names are globally unique, alphanumeric only, max 50 chars.
   acr_name = substr(replace("acr${var.name_prefix}${var.environment}${var.unique_suffix}", "-", ""), 0, 50)
+
+  # Azure storage and Key Vault network ACLs reject a /32 suffix — a single
+  # address must be given bare. Callers pass ordinary CIDRs, so normalise here
+  # rather than making every environment remember the quirk. Only apply/plan
+  # against the real API surfaces this; the schema accepts /32 happily.
+  allowed_ips = [for c in var.allowed_ip_ranges : replace(c, "/32", "")]
+
 }
 
 resource "azurerm_resource_group" "platform" {
@@ -82,6 +89,20 @@ resource "azurerm_container_registry" "main" {
   tags = local.common_tags
 }
 
+# AcrPull for the cluster's kubelet identity is granted *here*, by the module
+# that owns the registry, rather than in the AKS module. The dependency only
+# runs one way — platform-identity needs the cluster's OIDC issuer, so ACR is
+# created after AKS — and asking the AKS module to reference an ACR that does
+# not exist yet would be a cycle. Without this assignment every image pull
+# fails with a 401 from the registry's token endpoint.
+resource "azurerm_role_assignment" "kubelet_acr_pull" {
+  count = var.kubelet_identity_principal_id == "" ? 0 : 1
+
+  scope                = azurerm_container_registry.main.id
+  role_definition_name = "AcrPull"
+  principal_id         = var.kubelet_identity_principal_id
+}
+
 resource "azurerm_private_endpoint" "acr" {
   count = var.environment == "prod" ? 1 : 0
 
@@ -130,7 +151,7 @@ resource "azurerm_key_vault" "main" {
     bypass                     = "AzureServices"
     default_action             = "Deny"
     virtual_network_subnet_ids = [var.apps_subnet_id]
-    ip_rules                   = var.allowed_ip_ranges
+    ip_rules                   = local.allowed_ips
   }
 
   tags = local.common_tags
@@ -174,6 +195,21 @@ resource "azurerm_role_assignment" "platform_admins_kv" {
   scope                = azurerm_key_vault.main.id
   role_definition_name = "Key Vault Administrator"
   principal_id         = each.value
+}
+
+# Role assignments are not effective the instant the ARM call returns: the data
+# plane can still answer 403 ForbiddenByRbac for up to a minute. Anything that
+# writes a secret in the same apply must wait, or the apply fails on a
+# permission the operator demonstrably has.
+resource "time_sleep" "kv_rbac_propagation" {
+  count = var.rbac_propagation_seconds > 0 ? 1 : 0
+
+  depends_on = [
+    azurerm_role_assignment.platform_admins_kv,
+    azurerm_role_assignment.csi_driver_kv_reader,
+  ]
+
+  create_duration = "${var.rbac_propagation_seconds}s"
 }
 
 # ── Workload identities for applications ─────────────────────────────────────

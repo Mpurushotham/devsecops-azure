@@ -110,3 +110,14 @@ variable "enable_private_dns_zones" {
   type        = bool
   default     = true
 }
+
+variable "subnet_service_endpoints" {
+  description = <<-EOT
+    Service endpoints enabled on the cluster subnets. A subnet must carry the
+    endpoint for a service before it can be named in that service's network ACL;
+    Azure otherwise fails the ACL with SubnetsHaveNoServiceEndpointsConfigured.
+    Only relevant where private endpoints are not used.
+  EOT
+  type        = list(string)
+  default     = ["Microsoft.KeyVault", "Microsoft.Storage", "Microsoft.Sql"]
+}

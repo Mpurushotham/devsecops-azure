@@ -14,8 +14,13 @@ output "acr_login_server" {
 }
 
 output "key_vault_id" {
-  description = "Resource ID of the Key Vault."
+  description = <<-EOT
+    Resource ID of the Key Vault. Gated behind the RBAC propagation wait, so any
+    module that writes a secret using this id is ordered after the role
+    assignments have had time to converge.
+  EOT
   value       = azurerm_key_vault.main.id
+  depends_on  = [time_sleep.kv_rbac_propagation]
 }
 
 output "key_vault_uri" {

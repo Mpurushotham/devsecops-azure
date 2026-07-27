@@ -149,6 +149,9 @@ module "platform_identity" {
   oidc_issuer_url = module.aks.oidc_issuer_url
   aks_cluster_id  = module.aks.cluster_id
 
+  # Lets the cluster pull from the registry this module creates.
+  kubelet_identity_principal_id = module.aks.kubelet_identity_principal_id
+
   data_subnet_id       = module.network.subnet_ids["data"]
   apps_subnet_id       = module.network.subnet_ids["apps"]
   private_dns_zone_ids = module.network.private_dns_zone_ids
@@ -239,7 +242,9 @@ resource "azurerm_role_assignment" "operator_cluster_user" {
 # The point of a sandbox on a real subscription is that it bills real money.
 # This alerts before that becomes a surprise rather than after.
 resource "azurerm_consumption_budget_subscription" "sandbox" {
-  count = var.monthly_budget_eur > 0 ? 1 : 0
+  # A budget with no notification is inert — Azure requires at least one, and
+  # so does the point of having it. Both conditions must hold.
+  count = var.monthly_budget_eur > 0 && length(var.budget_alert_emails) > 0 ? 1 : 0
 
   name            = "budget-${var.name_prefix}-${local.environment}"
   subscription_id = "/subscriptions/${var.subscription_id}"
@@ -252,7 +257,7 @@ resource "azurerm_consumption_budget_subscription" "sandbox" {
   }
 
   dynamic "notification" {
-    for_each = length(var.budget_alert_emails) > 0 ? [50, 80, 100] : []
+    for_each = [50, 80, 100]
     content {
       enabled        = true
       threshold      = notification.value

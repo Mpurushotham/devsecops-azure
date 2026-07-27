@@ -1,0 +1,807 @@
+<title>Azure Platform — Architecture &amp; Deployment Record</title>
+<style>
+  /* ── Tokens ────────────────────────────────────────────────────────────────
+     Neutrals carry a slight teal bias so they read as chosen, not inherited.
+     Accent is a verification teal: the through-line is controls that hold. */
+  :root {
+    --ground:      #f6f8f7;
+    --ground-2:    #edf1ef;
+    --ground-sunk: #e3e9e6;
+    --ink:         #161b1a;
+    --ink-2:       #414b48;
+    --ink-3:       #6b7773;
+    --rule:        #d2dad6;
+    --rule-strong: #b6c2bd;
+    --accent:      #1f6f5f;
+    --accent-soft: #d9e8e3;
+    --enforced:    #2f6d46;
+    --denied:      #a33f2c;
+    --cost:        #7d6224;
+    --shadow:      0 1px 2px rgba(22,27,26,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:      #12171a;
+      --ground-2:    #171d21;
+      --ground-sunk: #1d2429;
+      --ink:         #e6ecea;
+      --ink-2:       #b0bcb8;
+      --ink-3:       #7d8b86;
+      --rule:        #262f34;
+      --rule-strong: #38444a;
+      --accent:      #4fb69d;
+      --accent-soft: #16302b;
+      --enforced:    #5aa877;
+      --denied:      #d4705c;
+      --cost:        #c2a355;
+      --shadow:      none;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #12171a;
+    --ground-2:    #171d21;
+    --ground-sunk: #1d2429;
+    --ink:         #e6ecea;
+    --ink-2:       #b0bcb8;
+    --ink-3:       #7d8b86;
+    --rule:        #262f34;
+    --rule-strong: #38444a;
+    --accent:      #4fb69d;
+    --accent-soft: #16302b;
+    --enforced:    #5aa877;
+    --denied:      #d4705c;
+    --cost:        #c2a355;
+    --shadow:      none;
+  }
+  :root[data-theme="light"] {
+    --ground:      #f6f8f7;
+    --ground-2:    #edf1ef;
+    --ground-sunk: #e3e9e6;
+    --ink:         #161b1a;
+    --ink-2:       #414b48;
+    --ink-3:       #6b7773;
+    --rule:        #d2dad6;
+    --rule-strong: #b6c2bd;
+    --accent:      #1f6f5f;
+    --accent-soft: #d9e8e3;
+    --enforced:    #2f6d46;
+    --denied:      #a33f2c;
+    --cost:        #7d6224;
+    --shadow:      0 1px 2px rgba(22,27,26,.06);
+  }
+
+  /* Monospace as the display face: the platform's own vernacular is terraform,
+     kubectl and YAML. Humanist sans carries the prose. */
+  :root {
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", system-ui, sans-serif;
+  }
+
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 1.25rem 6rem;
+    overflow-x: hidden;
+  }
+
+  .wrap { max-width: 78ch; margin: 0 auto; }
+  .prose { max-width: 68ch; }
+  .bleed { max-width: 108ch; margin-inline: auto; }
+
+  /* ── Masthead ───────────────────────────────────────────────────────────── */
+  header.masthead {
+    padding: 5rem 0 2.25rem;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 2.5rem;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .7rem;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1.1rem;
+    display: flex;
+    gap: .55rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .eyebrow::before {
+    content: "";
+    width: 1.6rem; height: 1px;
+    background: var(--accent);
+    flex: none;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(1.85rem, 4.4vw, 2.9rem);
+    font-weight: 600;
+    letter-spacing: -.035em;
+    line-height: 1.1;
+    text-wrap: balance;
+    margin: 0 0 1rem;
+  }
+  .standfirst {
+    font-size: 1.08rem;
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  /* ── Live status band ───────────────────────────────────────────────────── */
+  .status {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    margin: 2.25rem 0 0;
+    overflow: hidden;
+  }
+  .status div { background: var(--ground-2); padding: .95rem 1.05rem; }
+  .status dt {
+    font-family: var(--mono);
+    font-size: .66rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 .3rem;
+  }
+  .status dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 1.02rem;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.01em;
+  }
+  .live { color: var(--enforced); }
+
+  /* ── Sections ───────────────────────────────────────────────────────────── */
+  section { margin: 4rem 0 0; }
+  h2 {
+    font-family: var(--mono);
+    font-size: 1.28rem;
+    font-weight: 600;
+    letter-spacing: -.02em;
+    margin: 0 0 .35rem;
+    padding-left: .9rem;
+    border-left: 3px solid var(--accent);
+    text-wrap: balance;
+  }
+  .section-note {
+    padding-left: 1.05rem;
+    color: var(--ink-3);
+    font-size: .92rem;
+    margin: 0 0 1.6rem;
+    max-width: 62ch;
+  }
+  h3 {
+    font-family: var(--mono);
+    font-size: .96rem;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    margin: 2.4rem 0 .6rem;
+  }
+  p { margin: 0 0 1.05rem; }
+  a { color: var(--accent); text-underline-offset: .18em; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+  code {
+    font-family: var(--mono);
+    font-size: .875em;
+    background: var(--ground-sunk);
+    padding: .1em .34em;
+    border-radius: 2px;
+  }
+  strong { font-weight: 650; }
+
+  /* ── Ideas ──────────────────────────────────────────────────────────────── */
+  .ideas { display: grid; gap: 1.4rem; margin-top: 1.5rem; }
+  .idea {
+    border-left: 1px solid var(--rule-strong);
+    padding-left: 1.15rem;
+  }
+  .idea h3 { margin: 0 0 .4rem; color: var(--accent); }
+  .idea p { margin: 0; color: var(--ink-2); font-size: .96rem; }
+
+  /* ── Diagrams ───────────────────────────────────────────────────────────── */
+  .diagram {
+    background: var(--ground-2);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 1.5rem 1rem;
+    margin: 1.5rem 0 .6rem;
+    overflow-x: auto;
+  }
+  .diagram pre.mermaid { margin: 0; background: none; text-align: center; }
+  figcaption {
+    font-family: var(--mono);
+    font-size: .74rem;
+    color: var(--ink-3);
+    letter-spacing: .02em;
+    margin: 0 0 2rem;
+  }
+  figure { margin: 0; }
+
+  /* ── Tables ─────────────────────────────────────────────────────────────── */
+  .table-scroll { overflow-x: auto; margin: 1.3rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: .89rem;
+    min-width: 34rem;
+  }
+  th {
+    font-family: var(--mono);
+    font-size: .67rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    text-align: left;
+    font-weight: 500;
+    padding: 0 .85rem .55rem 0;
+    border-bottom: 1px solid var(--rule-strong);
+    white-space: nowrap;
+  }
+  td {
+    padding: .6rem .85rem .6rem 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  td.num, th.num { font-variant-numeric: tabular-nums; text-align: right; padding-right: 1.2rem; }
+  tbody tr:last-child td { border-bottom: none; }
+  .mono-cell { font-family: var(--mono); font-size: .84rem; }
+
+  /* ── Evidence list ──────────────────────────────────────────────────────── */
+  .evidence {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(15.5rem, 1fr));
+    gap: .5rem .9rem;
+    margin: 1.3rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .evidence li {
+    display: flex;
+    gap: .6rem;
+    align-items: baseline;
+    font-size: .875rem;
+    padding: .3rem 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .tick {
+    font-family: var(--mono);
+    font-size: .66rem;
+    letter-spacing: .09em;
+    color: var(--enforced);
+    flex: none;
+    padding-top: .1em;
+  }
+
+  /* ── Defect log: severity encoded in a left stripe ──────────────────────── */
+  .waves { margin-top: 1.4rem; }
+  .wave { margin-bottom: 2.2rem; }
+  .wave-head {
+    font-family: var(--mono);
+    font-size: .72rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 .8rem;
+    display: flex;
+    align-items: baseline;
+    gap: .6rem;
+  }
+  .wave-head b { color: var(--ink); font-weight: 600; letter-spacing: -.01em; text-transform: none; font-size: .92rem; }
+  .defect {
+    border-left: 3px solid var(--denied);
+    background: var(--ground-2);
+    padding: .8rem 1rem;
+    margin-bottom: .5rem;
+    border-radius: 0 2px 2px 0;
+  }
+  .defect .err {
+    font-family: var(--mono);
+    font-size: .82rem;
+    color: var(--denied);
+    display: block;
+    margin-bottom: .3rem;
+    word-break: break-word;
+  }
+  .defect .why { font-size: .88rem; color: var(--ink-2); margin: 0; }
+  .defect .fix {
+    font-size: .85rem;
+    margin: .45rem 0 0;
+    padding-left: .9rem;
+    border-left: 1px solid var(--rule-strong);
+    color: var(--ink-2);
+  }
+  .defect .fix::before {
+    content: "FIX ";
+    font-family: var(--mono);
+    font-size: .62rem;
+    letter-spacing: .12em;
+    color: var(--accent);
+  }
+
+  /* ── Callout ────────────────────────────────────────────────────────────── */
+  .callout {
+    border: 1px solid var(--rule-strong);
+    border-left: 3px solid var(--cost);
+    background: var(--ground-2);
+    padding: 1.1rem 1.25rem;
+    border-radius: 0 2px 2px 0;
+    margin: 1.6rem 0;
+  }
+  .callout p { margin: 0; font-size: .93rem; }
+  .callout p + p { margin-top: .6rem; }
+  .callout-label {
+    font-family: var(--mono);
+    font-size: .66rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--cost);
+    display: block;
+    margin-bottom: .45rem;
+  }
+
+  pre.term {
+    font-family: var(--mono);
+    font-size: .8rem;
+    line-height: 1.6;
+    background: var(--ground-sunk);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: .95rem 1.1rem;
+    overflow-x: auto;
+    margin: 1.2rem 0;
+  }
+  pre.term .cmt { color: var(--ink-3); }
+  pre.term .ok  { color: var(--enforced); }
+
+  footer {
+    margin-top: 5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--rule);
+    font-size: .84rem;
+    color: var(--ink-3);
+  }
+  footer p { margin: 0 0 .4rem; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+  @media (max-width: 40rem) {
+    header.masthead { padding-top: 3rem; }
+    .evidence { grid-template-columns: 1fr; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">Platform Engineering · Azure · Deployment record</p>
+    <h1>A platform you can apply, not just read</h1>
+    <p class="standfirst">
+      Terraform modules for AKS, identity, data and observability — built for a production
+      landing zone, then deployed for real on a 4&nbsp;vCPU subscription to find out which
+      parts were fiction. Nine defects surfaced. None of them were visible to
+      <code>terraform&nbsp;validate</code>.
+    </p>
+
+    <dl class="status">
+      <div><dt>Status</dt><dd class="live">Applied</dd></div>
+      <div><dt>Resources</dt><dd>61</dd></div>
+      <div><dt>Kubernetes</dt><dd>1.34.9</dd></div>
+      <div><dt>Region</dt><dd>swedencentral</dd></div>
+      <div><dt>vCPU used</dt><dd>4 / 4</dd></div>
+      <div><dt>Run rate</dt><dd>~€2.90/day</dd></div>
+    </dl>
+  </header>
+
+  <section>
+    <h2>Three ideas the design rests on</h2>
+    <p class="section-note">
+      Everything else is consequence. If you read nothing further, read these.
+    </p>
+
+    <div class="ideas">
+      <div class="idea">
+        <h3>No long-lived credentials exist</h3>
+        <p>
+          CI, Azure DevOps and pods all federate into Entra ID over OIDC. There is no
+          registry password, no service principal secret, no database password. Each
+          federated credential is pinned to a single claim — repository&nbsp;+&nbsp;environment,
+          or namespace&nbsp;+&nbsp;service account — so a compromised staging pod cannot obtain
+          a production token. The claim is the boundary.
+        </p>
+      </div>
+      <div class="idea">
+        <h3>The pipeline never deploys</h3>
+        <p>
+          CI builds and signs an image, then commits a digest change or opens a pull
+          request. Argo CD reconciles. A compromised pipeline can propose a change, not
+          make one — and rollback is <code>git revert</code>, the same mechanism as the
+          forward path, so it is exercised constantly instead of being an untested
+          emergency procedure.
+        </p>
+      </div>
+      <div class="idea">
+        <h3>Guardrails are enforced three times</h3>
+        <p>
+          The Helm chart sets the secure values; rendered output is asserted against 17
+          contract checks in CI; Kyverno and Pod Security reject violations at admission.
+          A team supplies an image and a few values. Being non-root with dropped
+          capabilities, resource requests, a disruption budget and a network policy is
+          not something they can forget.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="bleed">
+    <h2>How a change reaches production</h2>
+    <p class="section-note">
+      The dotted edge is the one that matters: CI writes to git, never to the cluster.
+    </p>
+
+    <figure>
+      <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph CI["CI — build &amp; prove"]
+    direction TB
+    A["lint · test"] --> B["SAST · SCA<br/>secrets · IaC"]
+    B --> C["build image<br/>SBOM + provenance"]
+    C --> D["cosign sign<br/>transparency log"]
+  end
+
+  R[("registry<br/>digest-pinned")]
+  G[("git<br/>environment overlays")]
+
+  subgraph K8S["AKS — reconcile &amp; admit"]
+    direction TB
+    AR["Argo CD"] --> KY["Kyverno<br/>+ Pod Security"]
+    KY --> W["workload"]
+  end
+
+  D --> R
+  D -.->|"opens PR<br/>updates digest"| G
+  G -->|"webhook"| AR
+  R -->|"pull by digest<br/>workload identity"| W
+
+  KV[("Key Vault")] -.->|"CSI, at mount"| W
+  W -->|"OTLP"| O["collector"]
+
+  classDef gate stroke-width:2px
+  class B,D,KY gate
+</pre>
+      </div>
+      <figcaption>Delivery path — the pipeline holds no cluster credentials</figcaption>
+    </figure>
+  </section>
+
+  <section class="bleed">
+    <h2>Network segmentation</h2>
+    <p class="section-note">
+      Four subnets by trust level, deny-by-default at every boundary. The data subnet
+      also denies <em>outbound</em> internet: a private endpoint never legitimately
+      originates a connection, which turns a stolen credential from an exfiltration path
+      into a dead end.
+    </p>
+
+    <figure>
+      <div class="diagram">
+<pre class="mermaid">
+flowchart TB
+  U["users"] -->|"443 only"| ING
+
+  subgraph VNET["spoke VNet"]
+    direction TB
+    ING["snet-ingress<br/><small>load balancer · WAF</small>"]
+    SYS["snet-aks-system<br/><small>platform components</small>"]
+    APP["snet-aks-apps<br/><small>workloads</small>"]
+    DATA["snet-data<br/><small>private endpoints only</small>"]
+    NAT["NAT gateway<br/><small>static egress IP</small>"]
+  end
+
+  PAAS[("SQL · Key Vault<br/>ACR · Blob")]
+  P["payment processors"]
+
+  ING -->|"8080"| APP
+  APP --> DATA
+  DATA -.->|"private link"| PAAS
+  APP --> NAT -->|"allowlisted"| P
+  DATA -->|"no outbound"| X(("denied"))
+
+  style X stroke-dasharray: 3 3
+</pre>
+      </div>
+      <figcaption>Segmentation — every subnet carries a deny-by-default NSG</figcaption>
+    </figure>
+  </section>
+
+  <section class="bleed">
+    <h2>Identity, end to end</h2>
+    <p class="section-note">
+      Three federation relationships replace three stored credentials. Verified on the
+      running pod: the webhook injected the client ID, tenant ID and a projected token
+      path. No Kubernetes Secret was created.
+    </p>
+
+    <figure>
+      <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant CI as CI pipeline
+  participant EID as Entra ID
+  participant ACR as Registry
+  participant Pod as payments-api
+  participant KV as Key Vault
+
+  Note over CI,ACR: build time
+  CI->>EID: OIDC token (repo + environment claim)
+  EID-->>CI: access token, ~1h
+  CI->>ACR: push (AcrPush)
+
+  Note over Pod,KV: runtime
+  Pod->>EID: projected SA token<br/>system:serviceaccount:payments:payments-api
+  EID-->>Pod: access token
+  Pod->>KV: read secret (Key Vault Secrets User)
+  KV-->>Pod: mounted via CSI, rotated every 2m
+</pre>
+      </div>
+      <figcaption>Federation — the claim is the security boundary, not a shared secret</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>Verified on the running cluster</h2>
+    <p class="section-note">
+      Read off the live pod and namespace, not from the plan.
+    </p>
+
+    <ul class="evidence">
+      <li><span class="tick">PASS</span> image digest-pinned</li>
+      <li><span class="tick">PASS</span> runAsNonRoot, uid 64198</li>
+      <li><span class="tick">PASS</span> read-only root filesystem</li>
+      <li><span class="tick">PASS</span> no privilege escalation</li>
+      <li><span class="tick">PASS</span> all capabilities dropped</li>
+      <li><span class="tick">PASS</span> seccomp RuntimeDefault</li>
+      <li><span class="tick">PASS</span> SA token not automounted</li>
+      <li><span class="tick">PASS</span> workload identity injected</li>
+      <li><span class="tick">PASS</span> Pod Security: restricted</li>
+      <li><span class="tick">PASS</span> NetworkPolicy default-deny</li>
+      <li><span class="tick">PASS</span> local cluster accounts disabled</li>
+      <li><span class="tick">PASS</span> Key Vault ACL default-deny</li>
+      <li><span class="tick">PASS</span> storage: no shared keys</li>
+      <li><span class="tick">PASS</span> registry admin user disabled</li>
+      <li><span class="tick">PASS</span> API server IP-restricted</li>
+      <li><span class="tick">PASS</span> security headers on responses</li>
+    </ul>
+
+    <h3>Two controls proved themselves by refusing work</h3>
+    <p>
+      Which is the only way to know a control is live rather than declared. Pod Security
+      <code>restricted</code> rejected a debug pod that omitted capability drops. The
+      default-deny NetworkPolicy blocked an in-cluster probe — the application was
+      reachable only through <code>kubectl port-forward</code>, because the chart's policy
+      admits ingress from the ingress controller and nothing else.
+    </p>
+
+<pre class="term"><span class="cmt"># the app, once reached through an allowed path</span>
+healthz: {"status":"ok"}
+readyz:  {"status":"ready"}
+info:    {"environment":"sandbox","service":"devsecops-app"}
+
+<span class="cmt"># response headers</span>
+Server: undisclosed                    <span class="cmt">← banner suppressed</span>
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Security-Policy: default-src 'self'</pre>
+  </section>
+
+  <section class="bleed">
+    <h2>What deploying for real found</h2>
+    <p class="section-note">
+      Nine defects in three waves. Each layer catches a class the previous one
+      structurally cannot — and <code>terraform validate</code> had been passing cleanly
+      throughout.
+    </p>
+
+    <div class="waves">
+
+      <div class="wave">
+        <p class="wave-head">Wave 1 <b>— found by <code>plan</code>, the dependency graph</b></p>
+        <div class="defect">
+          <span class="err">Invalid count argument</span>
+          <p class="why">
+            Eleven resources across four modules gated <code>count</code> on an id computed
+            by another resource in the same apply. Terraform cannot evaluate that at plan
+            time. It affected every environment equally — all validated cleanly, all would
+            have failed on first use.
+          </p>
+          <p class="fix">Gate on plain booleans that are known before the graph is walked.</p>
+        </div>
+      </div>
+
+      <div class="wave">
+        <p class="wave-head">Wave 2 <b>— found by <code>apply</code>, what Azure actually accepts</b></p>
+
+        <div class="defect">
+          <span class="err">K8sVersionNotSupported</span>
+          <p class="why">1.31 has left mainstream support and is now LTS-only.</p>
+          <p class="fix">Track a version with mainstream support; 1.34.</p>
+        </div>
+
+        <div class="defect">
+          <span class="err">SubnetsHaveNoServiceEndpointsConfigured</span>
+          <p class="why">
+            A subnet must carry a service endpoint before it can be named in a PaaS
+            network ACL. The ACL is accepted by the schema and rejected by the API.
+          </p>
+          <p class="fix">Service endpoints on the cluster subnets.</p>
+        </div>
+
+        <div class="defect">
+          <span class="err">ip_rules must start with IPV4 address</span>
+          <p class="why">Azure storage ACLs reject a <code>/32</code> suffix; a single address must be bare.</p>
+          <p class="fix">Normalise at the module boundary, so callers keep passing ordinary CIDRs.</p>
+        </div>
+
+        <div class="defect">
+          <span class="err">The VM size is not allowed in your subscription</span>
+          <p class="why">Standard_B2s (v1) is simply not offered on this subscription.</p>
+          <p class="fix">Standard_B2s_v2, verified against the SKU list first.</p>
+        </div>
+
+        <div class="defect">
+          <span class="err">KeyBasedAuthenticationNotPermitted</span>
+          <p class="why">
+            Shared keys are disabled on the storage account — correctly — but the provider's
+            own data-plane polling was still trying to use one.
+          </p>
+          <p class="fix"><code>storage_use_azuread = true</code>.</p>
+        </div>
+
+        <div class="defect">
+          <span class="err">403 ForbiddenByRbac</span>
+          <p class="why">
+            Entra RBAC is eventually consistent. A secret write in the same apply raced the
+            role assignment and failed on a permission the operator demonstrably held.
+          </p>
+          <p class="fix">Gate the vault id output behind a propagation wait, so every consumer inherits the ordering.</p>
+        </div>
+      </div>
+
+      <div class="wave">
+        <p class="wave-head">Wave 3 <b>— found by running a workload on it</b></p>
+
+        <div class="defect">
+          <span class="err">FailedScheduling: didn't match node affinity</span>
+          <p class="why">
+            The chart selects <code>workload-type: application</code>. A single-pool cluster
+            had no node carrying that label.
+          </p>
+          <p class="fix">
+            The platform labels the system pool when there is no app pool — so one chart
+            works in every topology, rather than each environment overriding it.
+          </p>
+        </div>
+
+        <div class="defect">
+          <span class="err">401 Unauthorized from the registry token endpoint</span>
+          <p class="why">
+            The kubelet identity had no AcrPull. The cluster module cannot grant it: the
+            registry is created <em>after</em> the cluster, so referencing it there is a cycle.
+          </p>
+          <p class="fix">The assignment belongs to the module that owns the registry.</p>
+        </div>
+
+        <div class="defect">
+          <span class="err">Insufficient cpu — 2 pods Pending</span>
+          <p class="why">
+            AKS platform components alone request roughly 1.8 of 2 vCPU on one node. Two
+            nodes are needed before any workload fits.
+          </p>
+          <p class="fix">The autoscaler resolved it, 1 → 2 nodes. Worth knowing before sizing a small cluster.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="bleed">
+    <h2>Environment shapes</h2>
+    <p class="section-note">
+      One module set, four sizings. Every difference is deliberate and recorded against a
+      decision record.
+    </p>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th></th><th>sandbox</th><th>dev</th><th>staging</th><th>prod</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>API server</td><td class="mono-cell">public, CIDR</td><td class="mono-cell">public, CIDR</td><td class="mono-cell">public, CIDR</td><td class="mono-cell"><strong>private</strong></td></tr>
+          <tr><td>Zones</td><td class="num">—</td><td class="num">1</td><td class="num">1</td><td class="num">3</td></tr>
+          <tr><td>Nodes</td><td class="mono-cell">1–2 × B2s_v2</td><td class="mono-cell">1–8 × D4</td><td class="mono-cell">2–8 × D4</td><td class="mono-cell">5–30 × D8</td></tr>
+          <tr><td>Spot pool</td><td>—</td><td>—</td><td>—</td><td>batch</td></tr>
+          <tr><td>Windows pool</td><td>—</td><td>—</td><td>—</td><td>migration</td></tr>
+          <tr><td>SQL</td><td>off</td><td class="mono-cell">GP serverless</td><td class="mono-cell">GP serverless</td><td class="mono-cell"><strong>BC, zone-redundant</strong></td></tr>
+          <tr><td>Private endpoints</td><td>—</td><td>—</td><td>—</td><td>SQL · KV · ACR · Blob</td></tr>
+          <tr><td>Log retention</td><td class="mono-cell">30d</td><td class="mono-cell">30d</td><td class="mono-cell">30d</td><td class="mono-cell">180d</td></tr>
+          <tr><td>Alerting</td><td>—</td><td>—</td><td>tickets</td><td>pages on-call</td></tr>
+          <tr><td>Promotion</td><td>manual</td><td>auto-commit</td><td>PR review</td><td>PR + approval</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>What it costs, and why it should be torn down</h2>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Component</th><th class="num">Monthly</th><th>Note</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>2 × Standard_B2s_v2</td><td class="num">€61</td><td>the entire vCPU quota</td></tr>
+          <tr><td>Load balancer + IP</td><td class="num">€17</td><td>cluster egress</td></tr>
+          <tr><td>Managed disks</td><td class="num">€4</td><td>2 × 32 GB</td></tr>
+          <tr><td>Registry (Basic)</td><td class="num">€5</td><td></td></tr>
+          <tr><td>Log Analytics</td><td class="num">€0</td><td>capped inside the free grant</td></tr>
+          <tr><td>Key Vault · storage</td><td class="num">&lt;€2</td><td>per-operation</td></tr>
+          <tr><td>AKS control plane</td><td class="num">€0</td><td>Free tier</td></tr>
+          <tr><td><strong>Total</strong></td><td class="num"><strong>~€86</strong></td><td>~€2.90/day</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <span class="callout-label">Standing cost</span>
+      <p>
+        A budget alert at €50 fires at 50%, 80% and forecast 100% — but Azure budgets
+        <strong>alert, they do not enforce</strong>. Nothing stops this environment
+        spending until it is destroyed.
+      </p>
+      <p>
+        Teardown is a single command and is the intended end state:
+        <code>make destroy ENV=sandbox</code>.
+      </p>
+    </div>
+
+    <h3>What this deliberately does not claim</h3>
+    <p>
+      Only <code>sandbox</code> has been applied. The dev, staging and production shapes
+      are planned but unapplied, and their costs are estimates. Disaster recovery is
+      single-region with geo-redundant backups; a cross-region plan is the next piece of
+      work. The reference application demonstrates the platform contract and has no
+      business logic worth the name.
+    </p>
+  </section>
+
+  <footer>
+    <p>Azure platform lab — architecture and deployment record.</p>
+    <p>
+      Subscription identifiers, tenant and operator addresses are omitted throughout.
+      Costs are indicative for swedencentral and should be checked against current
+      pricing before being quoted.
+    </p>
+  </footer>
+
+</div>

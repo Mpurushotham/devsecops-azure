@@ -159,6 +159,12 @@ resource "azurerm_kubernetes_cluster" "main" {
     only_critical_addons_enabled = var.enable_app_pool
     temporary_name_for_rotation  = "systemtmp"
 
+    # The platform contract has workloads select `workload-type: application`
+    # (the chart's default nodeSelector). When there is no dedicated app pool,
+    # the system pool has to satisfy that selector — otherwise every chart
+    # would need a per-environment override, which defeats having one chart.
+    node_labels = var.enable_app_pool ? {} : { "workload-type" = "application" }
+
     upgrade_settings {
       max_surge = "33%"
     }

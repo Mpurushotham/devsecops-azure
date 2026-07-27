@@ -37,19 +37,23 @@ variable "vnet_cidr" {
 }
 
 variable "kubernetes_version" {
-  description = "AKS minor version."
+  description = "AKS minor version. Must still be in mainstream support — see `az aks get-versions`."
   type        = string
-  default     = "1.31"
+  default     = "1.34"
 }
 
 variable "node_vm_size" {
   description = <<-EOT
-    Node size. Standard_B2s is 2 vCPU / 4 GiB — the smallest that meets the AKS
-    system-pool minimum, and the cheapest family available. Two of them consume
-    the entire 4 vCPU regional quota on a free-tier subscription.
+    Node size. Standard_B2s_v2 is 2 vCPU / 8 GiB — two of them consume the
+    entire 4 vCPU regional quota on this subscription.
+
+    Not every size is offered on every subscription: Standard_B2s (v1) is
+    rejected here with "The VM size ... is not allowed in your subscription".
+    Confirm before changing:
+      az vm list-skus -l <region> --size Standard_B --query "[].name" -o tsv
   EOT
   type        = string
-  default     = "Standard_B2s"
+  default     = "Standard_B2s_v2"
 }
 
 variable "api_server_authorized_ip_ranges" {
