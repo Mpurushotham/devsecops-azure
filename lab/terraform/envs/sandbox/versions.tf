@@ -12,10 +12,18 @@ terraform {
     }
   }
 
-  # Local state on purpose. The sandbox exists to be created and destroyed on a
-  # subscription with no shared team backend; bootstrapping remote state would
-  # cost more than the environment it tracks. Every other environment uses the
-  # azurerm backend from lab/terraform/bootstrap.
+  # Remote state, because CI cannot operate local state. This started as local
+  # state on the argument that a disposable environment does not justify a
+  # backend — true right up until an Azure DevOps pipeline needed to plan
+  # against it, at which point "disposable" and "shared" stopped being
+  # compatible.
+  #
+  # The storage account is created outside Terraform, deliberately: the thing
+  # that holds state cannot be managed by the state it holds. Every other
+  # environment uses the account that lab/terraform/bootstrap creates.
+  backend "azurerm" {
+    use_azuread_auth = true
+  }
 }
 
 provider "azurerm" {
