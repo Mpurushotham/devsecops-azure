@@ -38,6 +38,8 @@ rules are reused rather than forked; nothing here modifies it.
 | [MIGRATION-DOTNET.md](docs/MIGRATION-DOTNET.md) | Legacy .NET Framework VMs → containerised .NET 10 on AKS |
 | [SANDBOX.md](docs/SANDBOX.md) | Deploying to a real, quota-constrained subscription |
 | [architecture-view.html](docs/architecture-view.html) | Single-page architecture and deployment record — diagrams, live evidence, defect log |
+| [COVERAGE.md](docs/COVERAGE.md) | What is **proven** on live Azure vs **coded** vs **absent**, against the role |
+| [INTERVIEW-NOTES.md](docs/INTERVIEW-NOTES.md) | Defending the design: what, why, what it cost, what would change it |
 
 ---
 
@@ -191,6 +193,8 @@ Everything in this lab has been checked locally, not just written:
 | **`terraform apply` against a live subscription** (`sandbox`) | **Applied — 61 resources, AKS 1.34.9** |
 | Security controls asserted on the running pod | 16/16 preserved |
 | Reference app deployed via Helm and serving | Pass — `/healthz`, `/readyz`, headers intact |
+| Argo CD reconciling from git, self-heal verified | Pass — `Synced/Healthy`, deployment restored in ~25s |
+| RabbitMQ running, queue declared, AMQP reachable | Pass — after an explicit NetworkPolicy allow |
 
 The one Trivy exception is recorded in `.trivyignore.yaml` with a justification
 and an expiry date, because a suppression without a review date becomes a
@@ -208,11 +212,13 @@ Stated plainly, so the gaps are visible rather than discovered:
   [SANDBOX.md](docs/SANDBOX.md) — that exercise found **nine** defects across
   three waves (graph, Azure API, running workload), every one of which
   `terraform validate` had been passing cleanly.
-- **RabbitMQ is referenced, not provisioned.** KEDA triggers and network policy
-  ports are in place; the cluster itself would be installed via the RabbitMQ
-  Cluster Operator in a follow-up.
-- **The .NET app is a reference, not a product.** It demonstrates the platform
-  contract and has no meaningful business logic or test suite of its own.
+- **RabbitMQ runs as a single node with ephemeral storage.** Enough to prove the
+  tier and give KEDA a queue; production wants the Cluster Operator with a
+  3-node quorum and persistent volumes. KEDA itself is not installed.
+- **The .NET app is written but never compiled.** No SDK was available, so the
+  workload actually running is the repository's Python service against the same
+  chart, identity wiring and security contract. Read the .NET code as a design
+  artifact, not as tested software. See [COVERAGE.md](docs/COVERAGE.md).
 - **Disaster recovery is single-region.** Multi-zone within the region, with
   geo-redundant backups; a documented cross-region recovery plan is the next
   piece of work. ([ADR-012](docs/DECISIONS.md#adr-012))

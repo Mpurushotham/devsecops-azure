@@ -16,7 +16,11 @@ checks:
     - privilege-escalation-container
 
     # ── Mirrors kyverno/require-resource-limits.yaml ─────────────────────────
-    - unset-cpu-requirements
+    # `unset-cpu-requirements` is deliberately NOT included: it demands a CPU
+    # *limit*, and this platform deliberately sets CPU requests without limits
+    # on request-path services. CFS throttling a latency-sensitive service to
+    # enforce a quota it is not exceeding makes p99 worse for no benefit.
+    # The policy we do want is expressed as a custom check below.
     - unset-memory-requirements
 
     # ── Mirrors kyverno/require-image-digest.yaml ────────────────────────────
@@ -43,10 +47,37 @@ checks:
     - ssh-port
 
   exclude:
+    # Demands a CPU *limit*. This platform sets CPU requests without limits on
+    # request-path services: CFS throttling a latency-sensitive service to
+    # enforce a quota it is not exceeding makes p99 worse for no benefit. The
+    # policy we do want — a request on every container — is the custom check
+    # `require-cpu-request` below.
+    - unset-cpu-requirements
+
     # Observability agents (Falco, Fluent Bit, node-exporter) legitimately need
     # host mounts and privileged access; they are reviewed as infrastructure and
     # live in the `security`/`monitoring` namespaces whose PodSecurity level is
     # deliberately `privileged`/`baseline`.
     - default-service-account
 
-customChecks: []
+customChecks:
+  # What the platform actually requires of CPU: a request on every container, so
+  # the scheduler and the autoscaler can both reason about it. Limits are left
+  # to the workload owner and are the exception, not the rule — see the
+  # resources block in lab/charts/dotnet-service/values.yaml.
+  - name: require-cpu-request
+    description: Every container must declare a CPU request.
+    remediation: >-
+      Set resources.requests.cpu. Without it the scheduler treats the container
+      as best-effort and the HPA has no denominator to compute utilisation from.
+    scope:
+      objectKinds:
+        - DeploymentLike
+    template: cpu-requirements
+    params:
+      # The bounds describe the VIOLATING range, not the acceptable one — the
+      # built-in check uses 0..0 to mean "unset". Easy to get backwards, and it
+      # inverts the check silently rather than erroring.
+      requirementsType: request
+      lowerBoundMillis: 0
+      upperBoundMillis: 0
