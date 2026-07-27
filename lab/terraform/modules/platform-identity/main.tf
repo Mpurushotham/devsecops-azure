@@ -26,6 +26,13 @@ locals {
   kv_name = substr(replace("kv-${local.name_prefix}-${var.unique_suffix}", "_", "-"), 0, 24)
   # ACR names are globally unique, alphanumeric only, max 50 chars.
   acr_name = substr(replace("acr${var.name_prefix}${var.environment}${var.unique_suffix}", "-", ""), 0, 50)
+
+  # Azure storage and Key Vault network ACLs reject a /32 suffix — a single
+  # address must be given bare. Callers pass ordinary CIDRs, so normalise here
+  # rather than making every environment remember the quirk. Only apply/plan
+  # against the real API surfaces this; the schema accepts /32 happily.
+  allowed_ips = [for c in var.allowed_ip_ranges : replace(c, "/32", "")]
+
 }
 
 resource "azurerm_resource_group" "platform" {
@@ -34,12 +41,21 @@ resource "azurerm_resource_group" "platform" {
   tags     = local.common_tags
 }
 
+# NOTE on count/for_each below: these gate on plain booleans, never on a value
+# that is computed by another resource. `count = var.some_id == "" ? 0 : 1` looks
+# equivalent but fails the plan with "Invalid count argument" whenever that id
+# comes from a resource created in the same apply — which is exactly how these
+# modules are wired together. Only a real `terraform plan` surfaces this;
+# `terraform validate` cannot.
+
 # ── Container registry ───────────────────────────────────────────────────────
 resource "azurerm_container_registry" "main" {
   name                = local.acr_name
   resource_group_name = azurerm_resource_group.platform.name
   location            = azurerm_resource_group.platform.location
-  sku                 = var.environment == "prod" ? "Premium" : "Standard"
+  # Basic is enough for a sandbox; Premium is required for private link,
+  # geo-replication and content trust, which only production uses.
+  sku = var.acr_sku != "" ? var.acr_sku : (var.environment == "prod" ? "Premium" : "Standard")
 
   # Admin user is a shared password with no audit trail — workload identity and
   # AcrPull role assignments replace it entirely.
@@ -60,7 +76,8 @@ resource "azurerm_container_registry" "main" {
 
   # Untagged manifests are garbage after 30 days; keeping them inflates cost and
   # widens the set of images an attacker could pull by digest.
-  retention_policy_in_days = var.environment == "prod" ? 30 : 7
+  # Retention policy is a Premium-only feature.
+  retention_policy_in_days = var.environment == "prod" ? 30 : null
 
   # Content trust: only signed images are pullable in production.
   trust_policy_enabled = var.environment == "prod"
@@ -70,6 +87,20 @@ resource "azurerm_container_registry" "main" {
   }
 
   tags = local.common_tags
+}
+
+# AcrPull for the cluster's kubelet identity is granted *here*, by the module
+# that owns the registry, rather than in the AKS module. The dependency only
+# runs one way — platform-identity needs the cluster's OIDC issuer, so ACR is
+# created after AKS — and asking the AKS module to reference an ACR that does
+# not exist yet would be a cycle. Without this assignment every image pull
+# fails with a 401 from the registry's token endpoint.
+resource "azurerm_role_assignment" "kubelet_acr_pull" {
+  count = var.kubelet_identity_principal_id == "" ? 0 : 1
+
+  scope                = azurerm_container_registry.main.id
+  role_definition_name = "AcrPull"
+  principal_id         = var.kubelet_identity_principal_id
 }
 
 resource "azurerm_private_endpoint" "acr" {
@@ -100,7 +131,9 @@ resource "azurerm_key_vault" "main" {
   location            = azurerm_resource_group.platform.location
   resource_group_name = azurerm_resource_group.platform.name
   tenant_id           = var.tenant_id
-  sku_name            = "premium" # HSM-backed keys for payment-related material
+  # HSM-backed keys for payment-related material in production; standard
+  # elsewhere, since premium bills per key per month.
+  sku_name = var.key_vault_sku != "" ? var.key_vault_sku : (var.environment == "prod" ? "premium" : "standard")
 
   # RBAC instead of access policies: one authorization model across the estate,
   # auditable through the same role assignment reports as everything else.
@@ -118,7 +151,7 @@ resource "azurerm_key_vault" "main" {
     bypass                     = "AzureServices"
     default_action             = "Deny"
     virtual_network_subnet_ids = [var.apps_subnet_id]
-    ip_rules                   = var.allowed_ip_ranges
+    ip_rules                   = local.allowed_ips
   }
 
   tags = local.common_tags
@@ -148,7 +181,7 @@ resource "azurerm_private_endpoint" "keyvault" {
 
 # The CSI driver identity only ever reads secrets — never writes, never manages.
 resource "azurerm_role_assignment" "csi_driver_kv_reader" {
-  count = var.key_vault_csi_identity_object_id == "" ? 0 : 1
+  count = var.enable_csi_driver_access ? 1 : 0
 
   scope                = azurerm_key_vault.main.id
   role_definition_name = "Key Vault Secrets User"
@@ -162,6 +195,21 @@ resource "azurerm_role_assignment" "platform_admins_kv" {
   scope                = azurerm_key_vault.main.id
   role_definition_name = "Key Vault Administrator"
   principal_id         = each.value
+}
+
+# Role assignments are not effective the instant the ARM call returns: the data
+# plane can still answer 403 ForbiddenByRbac for up to a minute. Anything that
+# writes a secret in the same apply must wait, or the apply fails on a
+# permission the operator demonstrably has.
+resource "time_sleep" "kv_rbac_propagation" {
+  count = var.rbac_propagation_seconds > 0 ? 1 : 0
+
+  depends_on = [
+    azurerm_role_assignment.platform_admins_kv,
+    azurerm_role_assignment.csi_driver_kv_reader,
+  ]
+
+  create_duration = "${var.rbac_propagation_seconds}s"
 }
 
 # ── Workload identities for applications ─────────────────────────────────────
@@ -232,7 +280,7 @@ resource "azurerm_role_assignment" "github_acr_push" {
 # Deploying via GitOps means the pipeline never needs cluster write access —
 # it only needs to read cluster metadata to run smoke tests.
 resource "azurerm_role_assignment" "github_aks_reader" {
-  count = var.github_repository == "" || var.aks_cluster_id == "" ? 0 : 1
+  count = var.github_repository != "" && var.enable_github_aks_reader ? 1 : 0
 
   scope                = var.aks_cluster_id
   role_definition_name = "Azure Kubernetes Service Cluster User Role"
@@ -241,7 +289,7 @@ resource "azurerm_role_assignment" "github_aks_reader" {
 
 # ── Diagnostics ──────────────────────────────────────────────────────────────
 resource "azurerm_monitor_diagnostic_setting" "keyvault" {
-  count = var.log_analytics_workspace_id == "" ? 0 : 1
+  count = var.enable_diagnostics ? 1 : 0
 
   name                       = "diag-kv-${local.name_prefix}"
   target_resource_id         = azurerm_key_vault.main.id
@@ -259,7 +307,7 @@ resource "azurerm_monitor_diagnostic_setting" "keyvault" {
 }
 
 resource "azurerm_monitor_diagnostic_setting" "acr" {
-  count = var.log_analytics_workspace_id == "" ? 0 : 1
+  count = var.enable_diagnostics ? 1 : 0
 
   name                       = "diag-acr-${local.name_prefix}"
   target_resource_id         = azurerm_container_registry.main.id

@@ -32,9 +32,9 @@ variable "vnet_cidr" {
 }
 
 variable "kubernetes_version" {
-  description = "AKS minor version."
+  description = "AKS minor version. Must still be in mainstream support — see `az aks get-versions`."
   type        = string
-  default     = "1.31"
+  default     = "1.34"
 }
 
 variable "cluster_admin_group_object_ids" {

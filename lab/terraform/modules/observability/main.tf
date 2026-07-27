@@ -171,7 +171,7 @@ resource "azurerm_monitor_data_collection_rule" "prometheus" {
 }
 
 resource "azurerm_monitor_data_collection_rule_association" "aks_prometheus" {
-  count = var.aks_cluster_id == "" ? 0 : 1
+  count = var.enable_aks_prometheus_scrape ? 1 : 0
 
   name                    = "dcra-prom-${local.name_prefix}"
   target_resource_id      = var.aks_cluster_id
@@ -385,7 +385,7 @@ resource "azurerm_key_vault_secret" "datadog_api_key" {
 }
 
 resource "azurerm_key_vault_secret" "appinsights_connection_string" {
-  count = var.key_vault_id == "" ? 0 : 1
+  count = var.enable_key_vault_secrets ? 1 : 0
 
   name         = "appinsights-connection-string"
   value        = azurerm_application_insights.main.connection_string

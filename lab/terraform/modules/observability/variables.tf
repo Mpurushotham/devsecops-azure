@@ -8,8 +8,10 @@ variable "environment" {
   type        = string
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: dev, staging, prod."
+    # "sandbox" is the quota-constrained shape used to exercise the modules
+    # against a free-tier subscription; it behaves like dev but smaller.
+    condition     = contains(["sandbox", "dev", "staging", "prod"], var.environment)
+    error_message = "environment must be one of: sandbox, dev, staging, prod."
   }
 }
 
@@ -134,4 +136,16 @@ variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
   default     = {}
+}
+
+variable "enable_aks_prometheus_scrape" {
+  description = "Associate the Prometheus data collection rule with aks_cluster_id."
+  type        = bool
+  default     = true
+}
+
+variable "enable_key_vault_secrets" {
+  description = "Write the App Insights connection string into key_vault_id."
+  type        = bool
+  default     = true
 }

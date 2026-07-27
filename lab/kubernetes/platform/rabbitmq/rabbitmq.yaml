@@ -1,0 +1,133 @@
+# =============================================================================
+# RabbitMQ — single node, sandbox sizing
+# =============================================================================
+# The JD calls for RabbitMQ clusters; this is the smallest thing that proves the
+# tier and gives KEDA a real queue to scale on. It is deliberately NOT a
+# production topology — production wants the RabbitMQ Cluster Operator with a
+# 3-node quorum, persistent volumes and a PodDisruptionBudget.
+#
+# The Bitnami chart was the obvious choice and is not used: its published images
+# moved out from under the chart, so `helm install` pulls a tag that no longer
+# exists on Docker Hub. The official image plus a manifest we control is fewer
+# moving parts and one less upstream that can break a deploy.
+#
+# Credentials here are sandbox-only and deliberately inert. In any other
+# environment these come from Key Vault via the CSI driver — see the
+# SecretProviderClass in the dotnet-service chart.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: messaging
+  labels: {app.kubernetes.io/name: rabbitmq, app.kubernetes.io/part-of: platform}
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/name: rabbitmq}
+  ports:
+    - {name: amqp, port: 5672, targetPort: 5672}
+    - {name: management, port: 15672, targetPort: 15672}
+    - {name: metrics, port: 15692, targetPort: 15692}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: messaging
+  labels: {app.kubernetes.io/name: rabbitmq, app.kubernetes.io/part-of: platform}
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: rabbitmq}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: rabbitmq}
+    spec:
+      # Same contract every workload on this platform meets.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      automountServiceAccountToken: false
+      nodeSelector: {workload-type: application}
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:4.1-management-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            # Read-only root, with writable mounts for exactly the paths
+            # RabbitMQ needs. Taking the exception would have been easier and
+            # would have left a container that can be modified at runtime.
+            readOnlyRootFilesystem: true
+          env:
+            - {name: RABBITMQ_DEFAULT_USER, value: platform}
+            - {name: RABBITMQ_DEFAULT_PASS, value: sandbox-only-not-a-secret}  # pragma: allowlist secret
+            - {name: RABBITMQ_NODENAME, value: rabbit@localhost}
+            - {name: RABBITMQ_USE_LONGNAME, value: "false"}
+          ports:
+            - {name: amqp, containerPort: 5672}
+            - {name: management, containerPort: 15672}
+            - {name: metrics, containerPort: 15692}
+          resources:
+            requests: {cpu: 100m, memory: 300Mi}
+            # A CPU limit here, unlike the application chart: a broker that
+            # spins is a platform-wide problem, and it is not on the
+            # latency-critical request path where throttling would hurt.
+            limits: {cpu: 500m, memory: 600Mi}
+          readinessProbe:
+            exec: {command: ["rabbitmq-diagnostics", "-q", "ping"]}
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+          livenessProbe:
+            exec: {command: ["rabbitmq-diagnostics", "-q", "status"]}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 15
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/rabbitmq}
+            - {name: tmp, mountPath: /tmp}
+            - {name: conf, mountPath: /etc/rabbitmq}
+            - {name: logs, mountPath: /var/log/rabbitmq}
+      volumes:
+        # emptyDir, not a PVC: a sandbox queue holds no durable state worth
+        # keeping and a PVC would outlive `make destroy`.
+        - name: data
+          emptyDir: {sizeLimit: 1Gi}
+        # Writable paths required by a read-only root filesystem: the image
+        # generates its config at start-up and Erlang uses /tmp.
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+        - name: conf
+          emptyDir: {sizeLimit: 16Mi}
+        # RabbitMQ writes a node log and, on a bad day, an Erlang crash dump.
+        # Discovered by trying: without it the broker exits with `erofs`.
+        - name: logs
+          emptyDir: {sizeLimit: 128Mi}
+---
+# Enable the Prometheus plugin endpoint so queue depth is scrapeable — the
+# signal KEDA scales on in the chart's example trigger.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rabbitmq
+  namespace: messaging
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: rabbitmq}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: payments}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: observability}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: keda}
+      ports:
+        - {port: 5672, protocol: TCP}
+        - {port: 15692, protocol: TCP}

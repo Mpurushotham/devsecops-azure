@@ -8,8 +8,10 @@ variable "environment" {
   type        = string
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: dev, staging, prod."
+    # "sandbox" is the quota-constrained shape used to exercise the modules
+    # against a free-tier subscription; it behaves like dev but smaller.
+    condition     = contains(["sandbox", "dev", "staging", "prod"], var.environment)
+    error_message = "environment must be one of: sandbox, dev, staging, prod."
   }
 }
 
@@ -117,4 +119,55 @@ variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
   default     = {}
+}
+
+variable "acr_sku" {
+  description = "Override the ACR SKU (Basic, Standard, Premium). Empty derives it from the environment."
+  type        = string
+  default     = ""
+}
+
+variable "key_vault_sku" {
+  description = "Override the Key Vault SKU (standard, premium). Empty derives it from the environment."
+  type        = string
+  default     = ""
+}
+
+variable "enable_csi_driver_access" {
+  description = "Grant the AKS Key Vault CSI identity read access to the vault."
+  type        = bool
+  default     = true
+}
+
+variable "enable_github_aks_reader" {
+  description = "Grant the GitHub deploy identity Cluster User on the AKS cluster."
+  type        = bool
+  default     = true
+}
+
+variable "enable_diagnostics" {
+  description = "Send Key Vault and ACR diagnostics to log_analytics_workspace_id."
+  type        = bool
+  default     = true
+}
+
+variable "rbac_propagation_seconds" {
+  description = <<-EOT
+    How long to wait after creating Key Vault role assignments before dependent
+    resources write to the vault. Entra RBAC is eventually consistent and the
+    data plane returns 403 until it converges. Zero disables the wait.
+  EOT
+  type        = number
+  default     = 60
+}
+
+variable "kubelet_identity_principal_id" {
+  description = <<-EOT
+    Principal ID of the AKS kubelet identity, granted AcrPull on this registry.
+    Empty skips the assignment. This is a plain input rather than a lookup so
+    the dependency stays one-directional: AKS is created first, then this module
+    grants the cluster access to the registry it creates.
+  EOT
+  type        = string
+  default     = ""
 }

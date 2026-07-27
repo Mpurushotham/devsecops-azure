@@ -18,6 +18,13 @@ locals {
   })
 
   is_prod = var.environment == "prod"
+
+  # Azure storage and Key Vault network ACLs reject a /32 suffix — a single
+  # address must be given bare. Callers pass ordinary CIDRs, so normalise here
+  # rather than making every environment remember the quirk. Only apply/plan
+  # against the real API surfaces this; the schema accepts /32 happily.
+  allowed_ips = [for c in var.allowed_ip_ranges : replace(c, "/32", "")]
+
 }
 
 resource "azurerm_resource_group" "data" {
@@ -28,6 +35,8 @@ resource "azurerm_resource_group" "data" {
 
 # ── SQL Server ───────────────────────────────────────────────────────────────
 resource "azurerm_mssql_server" "main" {
+  count = var.enable_sql ? 1 : 0
+
   name                = "sql-${local.name_prefix}-${var.unique_suffix}"
   resource_group_name = azurerm_resource_group.data.name
   location            = azurerm_resource_group.data.location
@@ -55,8 +64,10 @@ resource "azurerm_mssql_server" "main" {
 }
 
 resource "azurerm_mssql_database" "main" {
+  count = var.enable_sql ? 1 : 0
+
   name      = var.database_name
-  server_id = azurerm_mssql_server.main.id
+  server_id = azurerm_mssql_server.main[0].id
 
   # Business Critical gives local SSD storage and a built-in read replica;
   # General Purpose cannot meet the p99 latency target during peak.
@@ -101,6 +112,8 @@ resource "azurerm_mssql_database" "main" {
 
 # ── Private endpoint: SQL is never reachable from the internet ───────────────
 resource "azurerm_private_endpoint" "sql" {
+  count = var.enable_sql ? 1 : 0
+
   name                = "pe-sql-${local.name_prefix}"
   location            = azurerm_resource_group.data.location
   resource_group_name = azurerm_resource_group.data.name
@@ -109,7 +122,7 @@ resource "azurerm_private_endpoint" "sql" {
 
   private_service_connection {
     name                           = "psc-sql-${local.name_prefix}"
-    private_connection_resource_id = azurerm_mssql_server.main.id
+    private_connection_resource_id = azurerm_mssql_server.main[0].id
     subresource_names              = ["sqlServer"]
     is_manual_connection           = false
   }
@@ -122,8 +135,10 @@ resource "azurerm_private_endpoint" "sql" {
 
 # ── Threat detection ─────────────────────────────────────────────────────────
 resource "azurerm_mssql_server_security_alert_policy" "main" {
+  count = var.enable_sql ? 1 : 0
+
   resource_group_name = azurerm_resource_group.data.name
-  server_name         = azurerm_mssql_server.main.name
+  server_name         = azurerm_mssql_server.main[0].name
   state               = "Enabled"
 
   email_account_admins = true
@@ -132,19 +147,19 @@ resource "azurerm_mssql_server_security_alert_policy" "main" {
 }
 
 resource "azurerm_mssql_server_extended_auditing_policy" "main" {
-  count = var.log_analytics_workspace_id == "" ? 0 : 1
+  count = var.enable_sql && var.enable_diagnostics ? 1 : 0
 
-  server_id                       = azurerm_mssql_server.main.id
+  server_id                       = azurerm_mssql_server.main[0].id
   log_monitoring_enabled          = true
   retention_in_days               = 90
   storage_account_subscription_id = var.subscription_id
 }
 
 resource "azurerm_monitor_diagnostic_setting" "sql" {
-  count = var.log_analytics_workspace_id == "" ? 0 : 1
+  count = var.enable_sql && var.enable_diagnostics ? 1 : 0
 
   name                       = "diag-sql-${local.name_prefix}"
-  target_resource_id         = azurerm_mssql_database.main.id
+  target_resource_id         = azurerm_mssql_database.main[0].id
   log_analytics_workspace_id = var.log_analytics_workspace_id
 
   enabled_log {
@@ -177,9 +192,9 @@ resource "azurerm_monitor_diagnostic_setting" "sql" {
 # The matching CREATE USER FROM EXTERNAL PROVIDER statement is applied by the
 # schema migration job (see lab/apps/payments-api).
 resource "azurerm_role_assignment" "workload_sql_contributor" {
-  for_each = toset(var.workload_principal_ids)
+  for_each = var.enable_sql ? toset(var.workload_principal_ids) : toset([])
 
-  scope                = azurerm_mssql_server.main.id
+  scope                = azurerm_mssql_server.main[0].id
   role_definition_name = "SQL DB Contributor"
   principal_id         = each.value
 }
@@ -218,7 +233,7 @@ resource "azurerm_storage_account" "platform" {
     default_action             = "Deny"
     bypass                     = ["AzureServices", "Logging", "Metrics"]
     virtual_network_subnet_ids = [var.apps_subnet_id]
-    ip_rules                   = var.allowed_ip_ranges
+    ip_rules                   = local.allowed_ips
   }
 
   identity {
@@ -237,7 +252,7 @@ resource "azurerm_storage_container" "this" {
 }
 
 resource "azurerm_private_endpoint" "blob" {
-  count = local.is_prod ? 1 : 0
+  count = local.is_prod && var.enable_private_endpoints ? 1 : 0
 
   name                = "pe-blob-${local.name_prefix}"
   location            = azurerm_resource_group.data.location

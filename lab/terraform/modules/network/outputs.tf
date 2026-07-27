@@ -34,8 +34,12 @@ output "subnet_cidrs" {
 }
 
 output "nat_egress_ip" {
-  description = "Static outbound IP — this is the address partners and payment processors allowlist."
-  value       = azurerm_public_ip.nat.ip_address
+  description = <<-EOT
+    Static outbound IP — the address partners and payment processors allowlist.
+    Empty when the NAT gateway is disabled, in which case egress uses ephemeral
+    load-balancer addresses and is not allowlistable.
+  EOT
+  value       = try(azurerm_public_ip.nat[0].ip_address, "")
 }
 
 output "private_dns_zone_ids" {

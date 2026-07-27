@@ -5,17 +5,17 @@ output "resource_group_name" {
 
 output "sql_server_id" {
   description = "Resource ID of the SQL server."
-  value       = azurerm_mssql_server.main.id
+  value       = try(azurerm_mssql_server.main[0].id, "")
 }
 
 output "sql_server_fqdn" {
   description = "SQL server FQDN. Resolves to the private endpoint inside the VNet."
-  value       = azurerm_mssql_server.main.fully_qualified_domain_name
+  value       = try(azurerm_mssql_server.main[0].fully_qualified_domain_name, "")
 }
 
 output "database_name" {
   description = "Name of the application database."
-  value       = azurerm_mssql_database.main.name
+  value       = try(azurerm_mssql_database.main[0].name, "")
 }
 
 output "connection_string_template" {
@@ -23,7 +23,7 @@ output "connection_string_template" {
     Passwordless connection string for the app. Authentication is the pod's
     workload identity — there is deliberately no password placeholder here.
   EOT
-  value       = "Server=tcp:${azurerm_mssql_server.main.fully_qualified_domain_name},1433;Database=${azurerm_mssql_database.main.name};Authentication=Active Directory Default;Encrypt=True;TrustServerCertificate=False;"
+  value       = var.enable_sql ? "Server=tcp:${azurerm_mssql_server.main[0].fully_qualified_domain_name},1433;Database=${azurerm_mssql_database.main[0].name};Authentication=Active Directory Default;Encrypt=True;TrustServerCertificate=False;" : ""
 }
 
 output "storage_account_name" {
