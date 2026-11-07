@@ -261,7 +261,7 @@ jobs:
   verify:
     name: Verify dev deployment
     runs-on: ubuntu-24.04
-    needs: promote
+    needs: [build, promote]
     if: (github.event.inputs.environment || 'dev') == 'dev'
     timeout-minutes: 20
     environment: dev
