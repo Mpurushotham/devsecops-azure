@@ -362,7 +362,7 @@ jobs:
   final-image-scan:
     name: Final Image Scan (Trivy)
     runs-on: ubuntu-24.04
-    needs: [sign-image, slsa-provenance]
+    needs: [build-and-push, sign-image, slsa-provenance]
     timeout-minutes: 20
     env:
       IMAGE_REF: ${{ needs.build-and-push.outputs.image-ref }}
@@ -451,7 +451,7 @@ jobs:
   promote-to-prod-acr:
     name: Promote Image to Production ACR
     runs-on: ubuntu-24.04
-    needs: final-image-scan
+    needs: [build-and-push, final-image-scan]
     if: ${{ !contains(github.ref_name, '-rc.') }}   # Only stable releases
     timeout-minutes: 15
     environment:
@@ -515,7 +515,7 @@ jobs:
   create-github-release:
     name: Create GitHub Release
     runs-on: ubuntu-24.04
-    needs: [promote-to-prod-acr, generate-sbom]
+    needs: [build-and-push, promote-to-prod-acr, generate-sbom]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -592,6 +592,7 @@ jobs:
     name: Notify Azure Monitor
     runs-on: ubuntu-24.04
     needs:
+      - build-and-push
       - create-github-release
     if: always()
     timeout-minutes: 5
